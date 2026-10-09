@@ -673,99 +673,98 @@ dword_result_t NtDeviceIoControlFile_entry(
     xe::store_and_swap<uint64_t>(output_buffer, 0);
     xe::store_and_swap<uint64_t>(output_buffer + 8, cache_size);
   } else {
-    // Non-disk IOCTL — could be a NUI (Kinect) IOCTL.
-    // Check if the KinectInputDriver is available and the output buffer
-    // is large enough for a skeleton frame. If so, fill it with the
-    // latest skeleton data from the driver.
-    auto* kinect_driver = xe::hid::kinect::KinectInputDriver::instance();
-    if (kinect_driver && kinect_driver->is_initialized() &&
-        output_buffer && output_buffer_len >= sizeof(xe::hid::kinect::X_NUI_SKELETON_FRAME)) {
+    bool is_nui_device = file_path.find("PsCam") != std::string::npos ||
+                         file_path.find("Detroit") != std::string::npos ||
+                         file_path.find("Mca") != std::string::npos ||
+                         file_path.find("Nui") != std::string::npos;
 
-      xe::hid::kinect::X_NUI_SKELETON_FRAME host_frame{};
-      X_RESULT frame_result = kinect_driver->NuiSkeletonGetNextFrame(0, &host_frame);
+    if (is_nui_device) {
+      auto* kinect_driver = xe::hid::kinect::KinectInputDriver::instance();
+      if (kinect_driver && kinect_driver->is_initialized() &&
+          output_buffer && output_buffer_len >= sizeof(xe::hid::kinect::X_NUI_SKELETON_FRAME)) {
 
-      if (XSUCCEEDED(frame_result)) {
-        auto* dst = kernel_state()->memory()->TranslateVirtual<uint8_t*>(
-            output_buffer.guest_address());
-        if (dst) {
-          // Byte-swap and write the skeleton frame to guest memory.
-          // liTimeStamp (int64)
-          uint64_t ts = static_cast<uint64_t>(host_frame.liTimeStamp);
-          xe::store_and_swap<uint64_t>(reinterpret_cast<uint64_t*>(dst + 0), ts);
-          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(dst + 8), host_frame.dwFrameNumber);
-          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(dst + 12), host_frame.dwFlags);
+        xe::hid::kinect::X_NUI_SKELETON_FRAME host_frame{};
+        X_RESULT frame_result = kinect_driver->NuiSkeletonGetNextFrame(0, &host_frame);
 
-          // vFloorClipPlane (Vector4) — float bits stored as big-endian uint32
-          auto write_float = [](uint8_t* d, float v) {
-            uint32_t bits;
-            std::memcpy(&bits, &v, sizeof(float));
-            xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(d), bits);
-          };
-          write_float(dst + 16, host_frame.vFloorClipPlane.x);
-          write_float(dst + 20, host_frame.vFloorClipPlane.y);
-          write_float(dst + 24, host_frame.vFloorClipPlane.z);
-          write_float(dst + 28, host_frame.vFloorClipPlane.w);
+        if (XSUCCEEDED(frame_result)) {
+          auto* dst = kernel_state()->memory()->TranslateVirtual<uint8_t*>(
+              output_buffer.guest_address());
+          if (dst) {
+            // Byte-swap and write the skeleton frame to guest memory.
+            uint64_t ts = static_cast<uint64_t>(host_frame.liTimeStamp);
+            xe::store_and_swap<uint64_t>(reinterpret_cast<uint64_t*>(dst + 0), ts);
+            xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(dst + 8), host_frame.dwFrameNumber);
+            xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(dst + 12), host_frame.dwFlags);
 
-          // vNormalToGravity (Vector4)
-          write_float(dst + 32, host_frame.vNormalToGravity.x);
-          write_float(dst + 36, host_frame.vNormalToGravity.y);
-          write_float(dst + 40, host_frame.vNormalToGravity.z);
-          write_float(dst + 44, host_frame.vNormalToGravity.w);
+            auto write_float = [](uint8_t* d, float v) {
+              uint32_t bits;
+              std::memcpy(&bits, &v, sizeof(float));
+              xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(d), bits);
+            };
+            write_float(dst + 16, host_frame.vFloorClipPlane.x);
+            write_float(dst + 20, host_frame.vFloorClipPlane.y);
+            write_float(dst + 24, host_frame.vFloorClipPlane.z);
+            write_float(dst + 28, host_frame.vFloorClipPlane.w);
 
-          // SkeletonData[6]
-          constexpr uint32_t kSkelDataSize = 436;
-          constexpr uint32_t kSkelDataOffset = 48;
-          for (uint32_t s = 0; s < xe::hid::kinect::kNuiSkeletonCount; ++s) {
-            const auto& src = host_frame.SkeletonData[s];
-            uint8_t* sd = dst + kSkelDataOffset + s * kSkelDataSize;
+            write_float(dst + 32, host_frame.vNormalToGravity.x);
+            write_float(dst + 36, host_frame.vNormalToGravity.y);
+            write_float(dst + 40, host_frame.vNormalToGravity.z);
+            write_float(dst + 44, host_frame.vNormalToGravity.w);
 
-            xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 0), static_cast<uint32_t>(src.eTrackingState));
-            xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 4), src.dwTrackingID);
-            xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 8), src.dwEnrollmentIndex);
-            xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 12), src.dwUserIndex);
+            constexpr uint32_t kSkelDataSize = 436;
+            constexpr uint32_t kSkelDataOffset = 48;
+            for (uint32_t s = 0; s < xe::hid::kinect::kNuiSkeletonCount; ++s) {
+              const auto& src = host_frame.SkeletonData[s];
+              uint8_t* sd = dst + kSkelDataOffset + s * kSkelDataSize;
 
-            // Position (Vector4)
-            write_float(sd + 16, src.Position.x);
-            write_float(sd + 20, src.Position.y);
-            write_float(sd + 24, src.Position.z);
-            write_float(sd + 28, src.Position.w);
+              xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 0), static_cast<uint32_t>(src.eTrackingState));
+              xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 4), src.dwTrackingID);
+              xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 8), src.dwEnrollmentIndex);
+              xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 12), src.dwUserIndex);
 
-            // SkeletonPositions[20]
-            for (uint32_t j = 0; j < xe::hid::kinect::kNuiSkeletonPositionCount; ++j) {
-              uint8_t* jp = sd + 32 + j * 16;
-              write_float(jp + 0, src.SkeletonPositions[j].x);
-              write_float(jp + 4, src.SkeletonPositions[j].y);
-              write_float(jp + 8, src.SkeletonPositions[j].z);
-              write_float(jp + 12, src.SkeletonPositions[j].w);
+              write_float(sd + 16, src.Position.x);
+              write_float(sd + 20, src.Position.y);
+              write_float(sd + 24, src.Position.z);
+              write_float(sd + 28, src.Position.w);
+
+              for (uint32_t j = 0; j < xe::hid::kinect::kNuiSkeletonPositionCount; ++j) {
+                uint8_t* jp = sd + 32 + j * 16;
+                write_float(jp + 0, src.SkeletonPositions[j].x);
+                write_float(jp + 4, src.SkeletonPositions[j].y);
+                write_float(jp + 8, src.SkeletonPositions[j].z);
+                write_float(jp + 12, src.SkeletonPositions[j].w);
+              }
+
+              for (uint32_t j = 0; j < xe::hid::kinect::kNuiSkeletonPositionCount; ++j) {
+                xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 352 + j * 4), static_cast<uint32_t>(src.eSkeletonPositionTrackingState[j]));
+              }
+
+              xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 432), src.dwQualityFlags);
             }
 
-            // eSkeletonPositionTrackingState[20]
-            for (uint32_t j = 0; j < xe::hid::kinect::kNuiSkeletonPositionCount; ++j) {
-              xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 352 + j * 4), static_cast<uint32_t>(src.eSkeletonPositionTrackingState[j]));
+            XELOGI("NtDeviceIoControlFile(0x{:X}) on {} → NUI skeleton frame written ({:08X} bytes)",
+                   uint32_t(io_control_code), file_path, output_buffer_len.value());
+
+            if (io_status_block) {
+              io_status_block->status = 0;
+              io_status_block->information = output_buffer_len.value();
             }
-
-            // dwQualityFlags
-            xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 432), src.dwQualityFlags);
+            return X_STATUS_SUCCESS;
           }
-
-          XELOGI("NtDeviceIoControlFile(0x{:X}) on {} → NUI skeleton frame written ({:08X} bytes)",
-                 uint32_t(io_control_code), file_path, output_buffer_len.value());
-
-          if (io_status_block) {
-            io_status_block->status = 0;
-            io_status_block->information = output_buffer_len.value();
-          }
-          return X_STATUS_SUCCESS;
         }
       }
+
+      XELOGW("NtDeviceIoControlFile(0x{:X}) on {} - returning NUI success stub",
+             uint32_t(io_control_code), file_path);
+      if (output_buffer && output_buffer_len >= 4) {
+        xe::store_and_swap<uint32_t>(output_buffer, 1);
+      }
+      return X_STATUS_SUCCESS;
     }
 
-    XELOGW("NtDeviceIoControlFile(0x{:X}) on {} - returning success stub",
+    XELOGW("NtDeviceIoControlFile(0x{:X}) on {} - unhandled non-disk IOCTL",
            uint32_t(io_control_code), file_path);
-    // Write success status 0x1 to output buffer if requested
-    if (output_buffer && output_buffer_len >= 4) {
-      xe::store_and_swap<uint32_t>(output_buffer, 1);
-    }
+    return X_STATUS_INVALID_PARAMETER;
   }
  
   return X_STATUS_SUCCESS;

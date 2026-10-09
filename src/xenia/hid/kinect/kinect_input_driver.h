@@ -64,6 +64,7 @@
 #include <thread>
 
 #include "xenia/hid/input_driver.h"
+#include "xenia/ui/window_listener.h"
 
 namespace xe {
 namespace kernel {
@@ -280,6 +281,25 @@ class KinectInputDriver final : public InputDriver {
   void* fn_update_tilt_state_{nullptr};
   void* fn_get_tilt_state_{nullptr};
   void* fn_get_mks_accel_{nullptr};
+
+  // ── Virtual Input (Mouse / Gamepad -> Skeleton) ─────────────────────────
+  class WindowInputListenerImpl : public xe::ui::WindowInputListener {
+   public:
+    explicit WindowInputListenerImpl(KinectInputDriver* driver) : driver_(driver) {}
+    void OnMouseMove(xe::ui::MouseEvent& e) override;
+    void OnMouseDown(xe::ui::MouseEvent& e) override;
+    void OnMouseUp(xe::ui::MouseEvent& e) override;
+
+   private:
+    KinectInputDriver* driver_;
+  };
+  WindowInputListenerImpl window_input_listener_{this};
+
+  std::atomic<float> virtual_mouse_x_{0.f};
+  std::atomic<float> virtual_mouse_y_{0.f};
+  std::atomic<bool> virtual_mouse_active_{false};
+  std::atomic<bool> virtual_mouse_lbutton_{false};
+  std::atomic<bool> virtual_mouse_rbutton_{false};
 
   static KinectInputDriver* instance_;
 };

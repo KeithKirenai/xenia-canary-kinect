@@ -205,12 +205,6 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     }
     case 0x0002B001: {
       // NUI device initialization via XMsgInProcessCall.
-      // Allocate device + vtable from guest heap ONLY ONCE, then reuse.
-      // The game calls this repeatedly; leaking each time exhausts the heap.
-      static uint32_t cached_device_addr = 0;
-      static uint32_t cached_vtable_addr = 0;
-      static bool nui_stubs_registered = false;
-
       if (buffer_ptr) {
         auto* out = memory_->TranslateVirtual<uint32_t*>(buffer_ptr);
         if (out) {
@@ -229,14 +223,14 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
             kd()->NuiInitialize(0x08);
           }
 
-          // Allocate guest memory for mock NUI device only on first call:
-          if (!cached_device_addr) {
-            cached_device_addr = memory_->SystemHeapAlloc(4);
-            cached_vtable_addr = memory_->SystemHeapAlloc(128);
+          // Allocate guest memory for mock NUI device on first call:
+          if (!nui_device_addr_) {
+            nui_device_addr_ = memory_->SystemHeapAlloc(4);
+            nui_vtable_addr_ = memory_->SystemHeapAlloc(128);
 
-            if (cached_device_addr && cached_vtable_addr) {
+            if (nui_device_addr_ && nui_vtable_addr_) {
               // Register COM stubs once:
-              if (!nui_stubs_registered) {
+              if (!nui_stubs_registered_) {
                 uint32_t qi_trampoline =
                     kernel_state_->kernel_trampoline_group()->NewLongtermTrampoline(
                         NuiCOMStub_QueryInterface);
@@ -245,7 +239,7 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                         NuiCOMStub_Success);
 
                 auto* vtable_data =
-                    memory_->TranslateVirtual<uint32_t*>(cached_vtable_addr);
+                    memory_->TranslateVirtual<uint32_t*>(nui_vtable_addr_);
                 if (vtable_data) {
                   xe::store_and_swap<uint32_t>(&vtable_data[0], qi_trampoline);
                   for (int i = 1; i < 32; i++) {
@@ -255,24 +249,24 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                 }
 
                 auto* device_data =
-                    memory_->TranslateVirtual<uint32_t*>(cached_device_addr);
+                    memory_->TranslateVirtual<uint32_t*>(nui_device_addr_);
                 if (device_data) {
-                  xe::store_and_swap<uint32_t>(device_data, cached_vtable_addr);
+                  xe::store_and_swap<uint32_t>(device_data, nui_vtable_addr_);
                 }
-                nui_stubs_registered = true;
+                nui_stubs_registered_ = true;
               }
               XELOGI("XamApp: 0x2B001 mock device allocated: device={:08X}, vtable={:08X}",
-                     cached_device_addr, cached_vtable_addr);
+                     nui_device_addr_, nui_vtable_addr_);
             } else {
               XELOGE("XamApp: 0x2B001 SystemHeapAlloc FAILED (device={:08X}, vtable={:08X})",
-                     cached_device_addr, cached_vtable_addr);
-              cached_device_addr = 0;
-              cached_vtable_addr = 0;
+                     nui_device_addr_, nui_vtable_addr_);
+              nui_device_addr_ = 0;
+              nui_vtable_addr_ = 0;
             }
           }
 
-          // Signal the initialization event (every call):
-          if (original_handle) {
+          // Signal and register the notification event:
+          if (original_handle && original_handle < 0x7FFFFFFF) {
             auto object =
                 kernel_state_->object_table()->LookupObject<XObject>(original_handle);
             if (!object && original_handle == 0x3E8) {
@@ -285,7 +279,10 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
               if (object->type() == XObject::Type::Event) {
                 auto ev = static_cast<xe::kernel::XEvent*>(object.get());
                 ev->Set(0, false);
-                XELOGI("XamApp: 0x2B001 signaled Event handle {:08X}",
+                if (kd()) {
+                  kd()->SetSkeletonFrameEvent(ev);
+                }
+                XELOGI("XamApp: 0x2B001 signaled and registered Event handle {:08X}",
                        original_handle);
               } else if (object->type() == XObject::Type::Semaphore) {
                 auto sem = static_cast<xe::kernel::XSemaphore*>(object.get());
@@ -294,50 +291,29 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
             }
           }
 
-          // Ghidra revealed DAT_9251c3a0 is a C++ NUI object:
-          //   +0x00: vtable_ptr  (set up by game in Function_92116C60)
-          //   +0x18: ready_flag  (wait loop polls this, needs non-zero)
-          //   +0x38: secondary_flag
-          //
-          // The wait loop (Function_921131A0) takes this object as 'this':
-          //   while (this->ready_flag == 0) {
-          //     vtable[3](this); sleep(1000);
-          //   }
-          //
-          // Previously we wrote 0 to +0x00, DESTROYING the vtable.
-          // Now: DO NOT touch +0x00. Write device handle to +0x18 to unblock.
-
-          if (status_ptr) {
+          // If status_ptr points to a guest NUI C++ state object, unblock its ready flag:
+          if (status_ptr >= 0x10000 && status_ptr < 0x7F000000) {
             uint32_t ready_flag_addr = status_ptr + 0x18;
 
-            // First, read the current vtable at +0x00 to verify it's set:
             auto* vtable_slot = memory_->TranslateVirtual<uint32_t*>(status_ptr);
             if (vtable_slot) {
               uint32_t vtable_val = xe::load_and_swap<uint32_t>(vtable_slot);
               XELOGI("XamApp: 0x2B001 NUI object +0x00 vtable={:08X}", vtable_val);
             }
 
-            // Write device handle to +0x18 (ready flag) to unblock wait loop:
             auto* ready_slot = memory_->TranslateVirtual<uint32_t*>(ready_flag_addr);
             if (ready_slot) {
               xe::memory::PageAccess rp_old;
               xe::memory::Protect(ready_slot, 4, xe::memory::PageAccess::kReadWrite, &rp_old);
-              xe::store_and_swap<uint32_t>(ready_slot, cached_device_addr);
+              xe::store_and_swap<uint32_t>(ready_slot, nui_device_addr_);
               xe::memory::Protect(ready_slot, 4, rp_old);
               XELOGI("XamApp: 0x2B001 wrote device {:08X} to NUI ready_flag {:08X}",
-                     cached_device_addr, ready_flag_addr);
-            }
-
-            // Verify readback:
-            if (ready_slot) {
-              uint32_t readback = xe::load_and_swap<uint32_t>(ready_slot);
-              XELOGI("XamApp: 0x2B001 VERIFY ready_flag={:08X} readback={:08X}",
-                     ready_flag_addr, readback);
+                     nui_device_addr_, ready_flag_addr);
             }
           }
 
           XELOGI("XamApp: 0x2B001 done: event={:08X} nui_obj={:08X} device={:08X}",
-                 original_handle, status_ptr, cached_device_addr);
+                 original_handle, status_ptr, nui_device_addr_);
         }
       }
       return X_E_SUCCESS;

@@ -997,22 +997,6 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason,
     return X_STATUS_ABANDONED_WAIT_0;
   }
 
-  // Detect infinite-timeout waits on XEvent objects from NUI-related threads.
-  // If the game is waiting on an event with an infinite timeout, it's likely
-  // the skeleton frame event. Register it with KinectInputDriver so PollThread
-  // can signal it when new skeleton data is available.
-  bool is_infinite_wait = !timeout_ptr || *timeout_ptr == 0x7FFFFFFFFFFFFFFFULL ||
-                          *timeout_ptr == 0xFFFFFFFFFFFFFFFFULL;
-  if (is_infinite_wait && object->type() == XObject::Type::Event) {
-    auto* xevent = reinterpret_cast<XEvent*>(object.get());
-    auto* driver = xe::hid::kinect::KinectInputDriver::instance();
-    if (driver && driver->is_initialized()) {
-      driver->SetSkeletonFrameEvent(xevent);
-      XELOGI("xeKeWaitForSingleObject: registered NUI event handle={:08X}",
-             static_cast<uint32_t>(object->handle()));
-    }
-  }
-
   if (timeout_ptr == nullptr || *timeout_ptr != 0) {
     auto thread = XThread::GetCurrentThread();
     XELOGI("xeKeWaitForSingleObject: tid={:08X} obj={:08X} (type={}) timeout={}",

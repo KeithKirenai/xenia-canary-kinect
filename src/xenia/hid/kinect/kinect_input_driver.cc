@@ -10,6 +10,7 @@
 
 #include "xenia/hid/kinect/kinect_input_driver.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -95,9 +96,16 @@ KinectInputDriver* KinectInputDriver::instance_ = nullptr;
 
 KinectInputDriver::KinectInputDriver(xe::ui::Window* window,
                                      size_t window_z_order)
-    : InputDriver(window, window_z_order) {}
+    : InputDriver(window, window_z_order) {
+  if (window) {
+    window->AddInputListener(&window_input_listener_, window_z_order);
+  }
+}
 
 KinectInputDriver::~KinectInputDriver() {
+  if (window()) {
+    window()->RemoveInputListener(&window_input_listener_);
+  }
   instance_ = nullptr;
   thread_running_ = false;
   if (poll_thread_.joinable()) poll_thread_.join();
@@ -106,6 +114,41 @@ KinectInputDriver::~KinectInputDriver() {
   UnloadOpenNI2();
   UnloadMediaPipe();
   UnloadLibFreenect();
+}
+
+void KinectInputDriver::WindowInputListenerImpl::OnMouseMove(
+    xe::ui::MouseEvent& e) {
+  auto* win = driver_->window();
+  if (!win) return;
+  uint32_t w = win->GetActualLogicalWidth();
+  uint32_t h = win->GetActualLogicalHeight();
+  if (w > 0 && h > 0) {
+    float nx = (static_cast<float>(e.x()) / static_cast<float>(w)) * 2.0f - 1.0f;
+    float ny = 1.0f - (static_cast<float>(e.y()) / static_cast<float>(h)) * 2.0f;
+    driver_->virtual_mouse_x_.store(std::clamp(nx, -1.0f, 1.0f));
+    driver_->virtual_mouse_y_.store(std::clamp(ny, -1.0f, 1.0f));
+    driver_->virtual_mouse_active_.store(true);
+  }
+}
+
+void KinectInputDriver::WindowInputListenerImpl::OnMouseDown(
+    xe::ui::MouseEvent& e) {
+  if (e.button() == xe::ui::MouseEvent::Button::kLeft) {
+    driver_->virtual_mouse_lbutton_.store(true);
+    driver_->virtual_mouse_active_.store(true);
+  } else if (e.button() == xe::ui::MouseEvent::Button::kRight) {
+    driver_->virtual_mouse_rbutton_.store(true);
+    driver_->virtual_mouse_active_.store(true);
+  }
+}
+
+void KinectInputDriver::WindowInputListenerImpl::OnMouseUp(
+    xe::ui::MouseEvent& e) {
+  if (e.button() == xe::ui::MouseEvent::Button::kLeft) {
+    driver_->virtual_mouse_lbutton_.store(false);
+  } else if (e.button() == xe::ui::MouseEvent::Button::kRight) {
+    driver_->virtual_mouse_rbutton_.store(false);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +378,12 @@ void KinectInputDriver::BuildSyntheticFrame(X_NUI_SKELETON_FRAME* f) {
   f->vNormalToGravity = {0.f, 1.f, 0.f, 0.f};
   f->vFloorClipPlane = {0.f, 1.f, 0.f, 0.f};
 
+  bool use_mouse = virtual_mouse_active_.load();
+  float mx = virtual_mouse_x_.load();
+  float my = virtual_mouse_y_.load();
+  bool lbtn = virtual_mouse_lbutton_.load();
+  bool rbtn = virtual_mouse_rbutton_.load();
+
   float wave = std::sin(f->liTimeStamp / 1e6 * 1.5) * 0.15f;
 
   auto& s = f->SkeletonData[0];
@@ -345,8 +394,46 @@ void KinectInputDriver::BuildSyntheticFrame(X_NUI_SKELETON_FRAME* f) {
 
   for (uint32_t j = 0; j < kNuiSkeletonPositionCount; ++j) {
     float x = kTPose[j][0], y = kTPose[j][1], z = kTPose[j][2];
-    if (j == NUI_JOINT_HAND_LEFT || j == NUI_JOINT_WRIST_LEFT) y += wave;
-    if (j == NUI_JOINT_HAND_RIGHT || j == NUI_JOINT_WRIST_RIGHT) y -= wave;
+
+    if (use_mouse) {
+      if (j == NUI_JOINT_HAND_RIGHT) {
+        x = mx * 0.85f;
+        y = my * 0.65f;
+        z = lbtn ? -0.35f : 0.0f;  // Push/slash forward on click
+      } else if (j == NUI_JOINT_WRIST_RIGHT) {
+        x = mx * 0.70f;
+        y = my * 0.52f;
+        z = (lbtn ? -0.35f : 0.0f) * 0.8f;
+      } else if (j == NUI_JOINT_ELBOW_RIGHT) {
+        x = 0.22f + (mx * 0.85f - 0.22f) * 0.5f;
+        y = 0.40f + (my * 0.65f - 0.40f) * 0.5f;
+        z = (lbtn ? -0.35f : 0.0f) * 0.5f;
+      } else if (j == NUI_JOINT_HAND_LEFT) {
+        if (rbtn) {
+          x = -mx * 0.85f;
+          y = my * 0.65f;
+          z = -0.35f;
+        } else {
+          y += wave;
+        }
+      } else if (j == NUI_JOINT_WRIST_LEFT) {
+        if (rbtn) {
+          x = -mx * 0.70f;
+          y = my * 0.52f;
+        } else {
+          y += wave;
+        }
+      } else if (j == NUI_JOINT_ELBOW_LEFT) {
+        if (rbtn) {
+          x = -0.22f + (-mx * 0.85f + 0.22f) * 0.5f;
+          y = 0.40f + (my * 0.65f - 0.40f) * 0.5f;
+        }
+      }
+    } else {
+      if (j == NUI_JOINT_HAND_LEFT || j == NUI_JOINT_WRIST_LEFT) y += wave;
+      if (j == NUI_JOINT_HAND_RIGHT || j == NUI_JOINT_WRIST_RIGHT) y -= wave;
+    }
+
     s.SkeletonPositions[j] = {x, y, 2.f + z, 1.f};
     s.eSkeletonPositionTrackingState[j] = X_NUI_SKELETON_POSITION_TRACKED;
   }

@@ -24,6 +24,11 @@ class XamApp : public App {
 
   X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                 uint32_t buffer_length) override;
+
+ private:
+  uint32_t nui_device_addr_ = 0;
+  uint32_t nui_vtable_addr_ = 0;
+  bool nui_stubs_registered_ = false;
 };
 
 }  // namespace apps

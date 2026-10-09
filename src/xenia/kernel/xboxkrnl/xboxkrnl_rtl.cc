@@ -625,14 +625,7 @@ void RtlEnterCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
                             nullptr);
   }
 
-  // Try to acquire. If another thread grabbed it first, spin briefly.
-  if (!xe::atomic_cas(-1, 0, &cs->lock_count)) {
-    // Another thread got there first - yield and retry a few times.
-    for (int i = 0; i < 16; i++) {
-      xe::threading::MaybeYield();
-      if (xe::atomic_cas(-1, 0, &cs->lock_count)) break;
-    }
-  }
+  assert_true(cs->owning_thread == 0);
   cs->owning_thread = cur_thread;
   cs->recursion_count = 1;
 }
@@ -671,21 +664,10 @@ void RtlLeaveCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
     XELOGE("Null critical section in RtlLeaveCriticalSection!");
     return;
   }
-  uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
-  if (cs->owning_thread != cur_thread) {
-    XELOGE("RtlLeaveCriticalSection: owning_thread (0x%X) != current thread "
-           "(0x%X). Forcing ownership to current thread.",
-           (uint32_t)cs->owning_thread, cur_thread);
-    cs->owning_thread = cur_thread;
-  }
+  assert_true(cs->owning_thread == XThread::GetCurrentThread()->guest_object());
 
   // Drop recursion count - if it isn't zero we still have the lock.
-  if (cs->recursion_count <= 0) {
-    XELOGE("RtlLeaveCriticalSection: recursion_count is %d, expected > 0. "
-           "Forcing to 1.",
-           (int32_t)cs->recursion_count);
-    cs->recursion_count = 1;
-  }
+  assert_true(cs->recursion_count > 0);
   if (--cs->recursion_count != 0) {
     assert_true(cs->recursion_count >= 0);
 
