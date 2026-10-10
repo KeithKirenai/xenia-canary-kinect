@@ -83,8 +83,7 @@ ImGuiDrawer::~ImGuiDrawer() {
 void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
   assert_not_null(dialog);
   // Check if already added.
-  if (std::find(dialogs_.cbegin(), dialogs_.cend(), dialog) !=
-      dialogs_.cend()) {
+  if (std::ranges::find(std::as_const(dialogs_), dialog) != dialogs_.cend()) {
     return;
   }
   if (dialogs_.empty() && !IsDrawingDialogs()) {
@@ -102,7 +101,7 @@ void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
 
 void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
   assert_not_null(dialog);
-  auto it = std::find(dialogs_.cbegin(), dialogs_.cend(), dialog);
+  auto it = std::ranges::find(std::as_const(dialogs_), dialog);
   if (it == dialogs_.cend()) {
     return;
   }
@@ -120,7 +119,7 @@ void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
 void ImGuiDrawer::AddNotification(ImGuiNotification* dialog) {
   assert_not_null(dialog);
   // Check if already added.
-  if (std::find(notifications_.cbegin(), notifications_.cend(), dialog) !=
+  if (std::ranges::find(std::as_const(notifications_), dialog) !=
       notifications_.cend()) {
     return;
   }
@@ -134,7 +133,7 @@ void ImGuiDrawer::AddNotification(ImGuiNotification* dialog) {
 
 void ImGuiDrawer::RemoveNotification(ImGuiNotification* dialog) {
   assert_not_null(dialog);
-  auto it = std::find(notifications_.cbegin(), notifications_.cend(), dialog);
+  auto it = std::ranges::find(std::as_const(notifications_), dialog);
   if (it == notifications_.cend()) {
     return;
   }
@@ -737,7 +736,7 @@ void ImGuiDrawer::OnKeyUp(KeyEvent& e) { OnKey(e, false); }
 void ImGuiDrawer::OnKeyChar(KeyEvent& e) {
   auto& io = GetIO();
   // TODO(Triang3l): Accept the Unicode character.
-  unsigned int character = static_cast<unsigned int>(e.virtual_key());
+  unsigned int character = static_cast<unsigned int>(e.unicode());
   if (character > 0 && character < 0x10000) {
     io.AddInputCharacter(character);
     e.set_handled(true);

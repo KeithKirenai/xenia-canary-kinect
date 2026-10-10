@@ -57,23 +57,26 @@
 
 // Available input drivers:
 #include "xenia/hid/kinect/kinect_hid.h"
+#if XE_PLATFORM_LINUX
+#include "xenia/hid/keyboard/keyboard_hid.h"
+#endif  // XE_PLATFORM_LINUX
 #include "xenia/hid/nop/nop_hid.h"
 #if !XE_PLATFORM_ANDROID
 #include "xenia/hid/sdl/sdl_hid.h"
 #endif  // !XE_PLATFORM_ANDROID
 #if XE_PLATFORM_WIN32
-#include "xenia/hid/winkey/winkey_hid.h"
+#include "xenia/hid/keyboard/keyboard_hid.h"
 #include "xenia/hid/xinput/xinput_hid.h"
 #endif  // XE_PLATFORM_WIN32
 
 #if XE_PLATFORM_WIN32
 #define APU_OPTIONS "[any, nop, sdl, xaudio2]"
 #define GPU_OPTIONS "[any, d3d12, vulkan, null]"
-#define HID_OPTIONS "[any, nop, sdl, winkey, xinput, kinect]"
+#define HID_OPTIONS "[any, nop, sdl, keyboard, xinput, kinect]"
 #elif XE_PLATFORM_LINUX
 #define APU_OPTIONS "[any, alsa, nop, sdl]"
 #define GPU_OPTIONS "[any, vulkan, null]"
-#define HID_OPTIONS "[any, nop, sdl, kinect]"
+#define HID_OPTIONS "[any, nop, sdl, keyboard, kinect]"
 #else
 #define APU_OPTIONS "[any, nop, sdl]"
 #define GPU_OPTIONS "[any, vulkan, null]"
@@ -231,7 +234,7 @@ class EmulatorApp final : public xe::ui::WindowedApp {
       }
 
       // "Specified" path. Winkey is always added on windows.
-      if (name != "winkey") {
+      if (name != "keyboard") {
         auto it = std::find_if(
             creators_.cbegin(), creators_.cend(),
             [&name](const auto& f) { return name.compare(f.name) == 0; });
@@ -247,7 +250,7 @@ class EmulatorApp final : public xe::ui::WindowedApp {
       // Always add winkey for passthrough.
       auto it = std::find_if(
           creators_.cbegin(), creators_.cend(),
-          [&name](const auto& f) { return f.name.compare("winkey") == 0; });
+          [&name](const auto& f) { return f.name.compare("keyboard") == 0; });
       if (it != creators_.cend() && (*it).is_available()) {
         auto instance = (*it).instantiate(std::forward<Args>(args)...);
         if (instance) {
@@ -456,9 +459,12 @@ std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
     factory.Add("sdl", xe::hid::sdl::Create);
 #endif  // !XE_PLATFORM_ANDROID
     factory.Add("kinect", xe::hid::kinect::Create);
+#if XE_PLATFORM_LINUX
+    factory.Add("keyboard", xe::hid::keyboard::Create);
+#endif
 #if XE_PLATFORM_WIN32
     // WinKey input driver should always be the last input driver added!
-    factory.Add("winkey", xe::hid::winkey::Create);
+    factory.Add("keyboard", xe::hid::keyboard::Create);
 #endif  // XE_PLATFORM_WIN32
     for (auto& driver : factory.CreateAll(cvars::hid, window,
                                           EmulatorWindow::kZOrderHidInput)) {
