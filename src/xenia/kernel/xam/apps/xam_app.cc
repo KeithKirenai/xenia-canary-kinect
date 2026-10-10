@@ -355,7 +355,7 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           if (original_handle && original_handle < 0x7FFFFFFF) {
             auto object =
                 kernel_state_->object_table()->LookupObject<XObject>(original_handle);
-            if (!object && original_handle == 0x3E8) {
+            if (!object) {
               auto ev = object_ref<XEvent>(new XEvent(kernel_state_));
               ev->Initialize(true, false);
               kernel_state_->object_table()->RestoreHandle(original_handle, ev.get());
@@ -379,13 +379,10 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
           // If status_ptr points to a guest NUI C++ state object, unblock its ready flag:
           if (status_ptr >= 0x10000 && status_ptr < 0xFF000000) {
-            uint32_t ready_flag_addr = status_ptr + 0x18;
-
             auto* vtable_slot = memory_->TranslateVirtual<uint32_t*>(status_ptr);
             if (vtable_slot) {
               uint32_t vtable_val = xe::load_and_swap<uint32_t>(vtable_slot);
               XELOGI("XamApp: 0x2B001 NUI object +0x00 vtable={:08X}", vtable_val);
-              // If status_ptr is directly an INuiSensor** or device pointer receiving slot (value is 0):
               if (vtable_val == 0) {
                 xe::memory::PageAccess rp_old;
                 xe::memory::Protect(vtable_slot, 4, xe::memory::PageAccess::kReadWrite, &rp_old);
@@ -396,16 +393,26 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
               }
             }
 
-            auto* ready_slot = memory_->TranslateVirtual<uint32_t*>(ready_flag_addr);
-            if (ready_slot) {
-              xe::memory::PageAccess rp_old;
-              xe::memory::Protect(ready_slot, 4, xe::memory::PageAccess::kReadWrite, &rp_old);
-              xe::store_and_swap<uint32_t>(ready_slot, nui_device_addr_);
-              xe::memory::Protect(ready_slot, 4, rp_old);
-              XELOGI("XamApp: 0x2B001 wrote device {:08X} to NUI ready_flag {:08X}",
-                     nui_device_addr_, ready_flag_addr);
+            // Write mock device into common offsets within the guest NUI state structure:
+            uint32_t offsets_to_set[] = {0x00, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20};
+            for (uint32_t off : offsets_to_set) {
+              auto* slot = memory_->TranslateVirtual<uint32_t*>(status_ptr + off);
+              if (slot) {
+                uint32_t current_val = xe::load_and_swap<uint32_t>(slot);
+                if (current_val == 0) {
+                  xe::memory::PageAccess rp_old;
+                  xe::memory::Protect(slot, 4, xe::memory::PageAccess::kReadWrite, &rp_old);
+                  xe::store_and_swap<uint32_t>(slot, nui_device_addr_);
+                  xe::memory::Protect(slot, 4, rp_old);
+                  XELOGI("XamApp: 0x2B001 wrote device {:08X} to status_ptr+0x{:02X}",
+                         nui_device_addr_, off);
+                }
+              }
             }
           }
+
+          // Also write mock device directly to out[1] if the buffer itself was expecting the interface pointer:
+          xe::store_and_swap<uint32_t>(&out[1], nui_device_addr_);
 
           // If hr_ptr is provided, write 0 (S_OK) so the caller's HRESULT check passes:
           if (hr_ptr >= 0x10000 && hr_ptr < 0xFF000000) {
