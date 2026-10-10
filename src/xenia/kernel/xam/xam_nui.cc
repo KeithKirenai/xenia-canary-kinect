@@ -471,10 +471,31 @@ DECLARE_XAM_EXPORT1(XamNuiGetDeviceSerialNumber, kNone, kStub);
 dword_result_t XamNuiGetLoadedDepthCalibration_entry(lpvoid_t out_calib) { return X_STATUS_NO_SUCH_FILE; }
 DECLARE_XAM_EXPORT1(XamNuiGetLoadedDepthCalibration, kNone, kStub);
 
-dword_result_t XamNuiGetTrueColorInfo_entry(lpvoid_t out_info) { return X_E_FAIL; }
+dword_result_t XamNuiGetTrueColorInfo_entry(lpvoid_t out_info) {
+  if (out_info) {
+    auto* dst = kernel_memory()->TranslateVirtual(out_info.guest_address());
+    if (dst) {
+      std::memset(dst, 0, 32);
+    }
+  }
+  return X_ERROR_SUCCESS;
+}
 DECLARE_XAM_EXPORT1(XamNuiGetTrueColorInfo, kNone, kStub);
 
-dword_result_t XamNuiGetCameraIntrinsics_entry(lpvoid_t out_intrinsics) { return X_E_FAIL; }
+dword_result_t XamNuiGetCameraIntrinsics_entry(lpvoid_t out_intrinsics) {
+  if (out_intrinsics) {
+    auto* dst = kernel_memory()->TranslateVirtual<float*>(out_intrinsics.guest_address());
+    if (dst) {
+      // Nominal Kinect v1 camera intrinsics (fx, fy, cx, cy):
+      // Color: focal length ~531.15 px, optical center (320, 240)
+      xe::store_and_swap<float>(&dst[0], 531.15f);
+      xe::store_and_swap<float>(&dst[1], 531.15f);
+      xe::store_and_swap<float>(&dst[2], 320.0f);
+      xe::store_and_swap<float>(&dst[3], 240.0f);
+    }
+  }
+  return X_ERROR_SUCCESS;
+}
 DECLARE_XAM_EXPORT1(XamNuiGetCameraIntrinsics, kNone, kStub);
 
 dword_result_t XamNuiGetFanRate_entry(lpdword_t out_rate) {
