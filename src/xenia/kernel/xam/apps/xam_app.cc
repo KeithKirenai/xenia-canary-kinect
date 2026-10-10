@@ -399,9 +399,19 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
               }
             }
 
-            // Write mock device into common offsets within the guest NUI state structure:
-            uint32_t offsets_to_set[] = {0x00, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20};
-            for (uint32_t off : offsets_to_set) {
+            // Dump memory of status_ptr:
+            auto* raw_mem = memory_->TranslateVirtual<uint32_t*>(status_ptr);
+            if (raw_mem) {
+              XELOGI("XamApp: 0x2B001 dump of status_ptr {:08X}: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                     status_ptr,
+                     xe::byte_swap(raw_mem[0]), xe::byte_swap(raw_mem[1]),
+                     xe::byte_swap(raw_mem[2]), xe::byte_swap(raw_mem[3]),
+                     xe::byte_swap(raw_mem[4]), xe::byte_swap(raw_mem[5]),
+                     xe::byte_swap(raw_mem[6]), xe::byte_swap(raw_mem[7]));
+            }
+
+            // Write mock device into any null slot within the first 0x80 bytes of status_ptr:
+            for (uint32_t off = 0; off <= 0x80; off += 4) {
               auto* slot = memory_->TranslateVirtual<uint32_t*>(status_ptr + off);
               if (slot) {
                 uint32_t current_val = xe::load_and_swap<uint32_t>(slot);
