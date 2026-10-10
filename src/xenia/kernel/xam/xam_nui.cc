@@ -176,17 +176,17 @@ DECLARE_XAM_EXPORT1(XamNuiCameraTiltGetStatus, kNone, kStub);
 
 dword_result_t XamNuiCameraElevationGetAngle_entry(lpqword_t unk1,
                                                    lpdword_t unk2) {
-  /* Notes:
-     - Xam 12611 does not show what unk1 is used for (Ghidra)
-  */
-  uint32_t tilt_status[] = {0x58745373, 0x50};  // (XtSs)? & bytes to copy
-  X_STATUS result = XamNuiCameraTiltGetStatus_entry(tilt_status);
-  if (XSUCCEEDED(result)) {
-    // operation here
-    // *unk1 = output1
-    // *unk2 = output2
+  int32_t angle = 0;
+  if (kd()) {
+    kd()->NuiCameraGetElevation(&angle);
   }
-  return result;
+  if (unk2) {
+    *unk2 = static_cast<uint32_t>(angle);
+  }
+  if (unk1) {
+    *unk1 = static_cast<uint64_t>(angle);
+  }
+  return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamNuiCameraElevationGetAngle, kNone, kStub);
 

@@ -516,8 +516,8 @@ bool KinectInputDriver::TryLoadWindowsSDK() {
   if (!bind_required("NuiSkeletonGetNextFrame", &win_NuiSkeletonGetNextFrame_))
     return false;
   bind_optional("NuiSkeletonTrackingEnable", &win_NuiSkeletonTrackingEnable_);
-  bind_optional("NuiCameraSetElevation", &win_NuiCameraSetElevation_);
-  bind_optional("NuiCameraGetElevation", &win_NuiCameraGetElevation_);
+  bind_optional("NuiCameraElevationSetAngle", &win_NuiCameraSetElevation_);
+  bind_optional("NuiCameraElevationGetAngle", &win_NuiCameraGetElevation_);
   XELOGI("KinectInputDriver: Kinect10.dll loaded successfully.");
   return true;
 #else
