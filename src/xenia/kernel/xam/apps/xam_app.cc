@@ -72,6 +72,72 @@ static void NuiCOMStub_ImageStreamOpen(xe::cpu::ppc::PPCContext* context) {
   context->r[3] = 0; // S_OK
 }
 
+static void NuiCOMStub_SkeletonGetNextFrame(xe::cpu::ppc::PPCContext* context) {
+  // r3 = this, r4 = dwMillisecondsToWait, r5 = pSkeletonFrame
+  uint32_t frame_ptr = static_cast<uint32_t>(context->r[5]);
+  if (frame_ptr && kd() && kd()->is_initialized()) {
+    xe::hid::kinect::X_NUI_SKELETON_FRAME host_frame{};
+    if (XSUCCEEDED(kd()->NuiSkeletonGetNextFrame(0, &host_frame))) {
+      auto* dst = context->TranslateVirtual<uint8_t*>(frame_ptr);
+      if (dst) {
+        uint64_t ts = static_cast<uint64_t>(host_frame.liTimeStamp);
+        xe::store_and_swap<uint64_t>(reinterpret_cast<uint64_t*>(dst + 0), ts);
+        xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(dst + 8), host_frame.dwFrameNumber);
+        xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(dst + 12), host_frame.dwFlags);
+
+        auto write_float = [](uint8_t* d, float v) {
+          uint32_t bits;
+          std::memcpy(&bits, &v, sizeof(float));
+          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(d), bits);
+        };
+        write_float(dst + 16, host_frame.vFloorClipPlane.x);
+        write_float(dst + 20, host_frame.vFloorClipPlane.y);
+        write_float(dst + 24, host_frame.vFloorClipPlane.z);
+        write_float(dst + 28, host_frame.vFloorClipPlane.w);
+
+        write_float(dst + 32, host_frame.vNormalToGravity.x);
+        write_float(dst + 36, host_frame.vNormalToGravity.y);
+        write_float(dst + 40, host_frame.vNormalToGravity.z);
+        write_float(dst + 44, host_frame.vNormalToGravity.w);
+
+        constexpr uint32_t kSkelDataSize = 436;
+        constexpr uint32_t kSkelDataOffset = 48;
+        for (uint32_t s = 0; s < xe::hid::kinect::kNuiSkeletonCount; ++s) {
+          const auto& src = host_frame.SkeletonData[s];
+          uint8_t* sd = dst + kSkelDataOffset + s * kSkelDataSize;
+
+          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 0), static_cast<uint32_t>(src.eTrackingState));
+          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 4), src.dwTrackingID);
+          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 8), src.dwEnrollmentIndex);
+          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 12), src.dwUserIndex);
+
+          write_float(sd + 16, src.Position.x);
+          write_float(sd + 20, src.Position.y);
+          write_float(sd + 24, src.Position.z);
+          write_float(sd + 28, src.Position.w);
+
+          for (uint32_t j = 0; j < xe::hid::kinect::kNuiSkeletonPositionCount; ++j) {
+            uint8_t* jp = sd + 32 + j * 16;
+            write_float(jp + 0, src.SkeletonPositions[j].x);
+            write_float(jp + 4, src.SkeletonPositions[j].y);
+            write_float(jp + 8, src.SkeletonPositions[j].z);
+            write_float(jp + 12, src.SkeletonPositions[j].w);
+          }
+
+          for (uint32_t j = 0; j < xe::hid::kinect::kNuiSkeletonPositionCount; ++j) {
+            xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 352 + j * 4), static_cast<uint32_t>(src.eSkeletonPositionTrackingState[j]));
+          }
+
+          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 432), src.dwQualityFlags);
+        }
+        context->r[3] = 0; // S_OK
+        return;
+      }
+    }
+  }
+  context->r[3] = 0; // S_OK
+}
+
 /* Notes:
    - Messages ids that start with 0x00021xxx are UI calls
    - Messages ids that start with 0x00023xxx are used for the user profile
@@ -248,6 +314,9 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                 uint32_t stream_open_trampoline =
                     kernel_state_->kernel_trampoline_group()->NewLongtermTrampoline(
                         NuiCOMStub_ImageStreamOpen);
+                uint32_t skeleton_frame_trampoline =
+                    kernel_state_->kernel_trampoline_group()->NewLongtermTrampoline(
+                        NuiCOMStub_SkeletonGetNextFrame);
 
                 auto* vtable_data =
                     memory_->TranslateVirtual<uint32_t*>(nui_vtable_addr_);
@@ -259,6 +328,8 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                   }
                   // Slot 4: NuiImageStreamOpen
                   xe::store_and_swap<uint32_t>(&vtable_data[4], stream_open_trampoline);
+                  // Slot 18: NuiSkeletonGetNextFrame
+                  xe::store_and_swap<uint32_t>(&vtable_data[18], skeleton_frame_trampoline);
                   // Slot 27: NuiStatus
                   xe::store_and_swap<uint32_t>(&vtable_data[27], status_trampoline);
                 }
