@@ -427,6 +427,11 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
             }
           }
 
+          // If out[3] is an output slot for the device interface pointer, populate it:
+          if (xe::byte_swap(out[3]) == 0) {
+            xe::store_and_swap<uint32_t>(&out[3], nui_device_addr_);
+          }
+
           // Only write mock device to out[1] if out[1] was initially null (i.e. expected as output):
           if (status_ptr == 0) {
             xe::store_and_swap<uint32_t>(&out[1], nui_device_addr_);

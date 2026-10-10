@@ -49,6 +49,31 @@ dword_result_t XamVoiceGetMicArrayStatus_entry() {
 }
 DECLARE_XAM_EXPORT1(XamVoiceGetMicArrayStatus, kNone, kStub);
 
+dword_result_t XamVoiceSetMicArrayIdleUsers_entry(dword_t mask) {
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamVoiceSetMicArrayIdleUsers, kNone, kStub);
+
+dword_result_t XamVoiceMuteMicArray_entry(dword_t mute) {
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamVoiceMuteMicArray, kNone, kStub);
+
+dword_result_t XamVoiceGetMicArrayUnderrunStatus_entry() {
+  return 0;
+}
+DECLARE_XAM_EXPORT1(XamVoiceGetMicArrayUnderrunStatus, kNone, kStub);
+
+dword_result_t XamVoiceGetMicArrayAudioEx_entry(lpvoid_t unk1, dword_t unk2) {
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamVoiceGetMicArrayAudioEx, kNone, kStub);
+
+dword_result_t XamVoiceDisableMicArray_entry() {
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamVoiceDisableMicArray, kNone, kStub);
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace xe
