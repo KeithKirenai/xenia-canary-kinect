@@ -378,13 +378,22 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           }
 
           // If status_ptr points to a guest NUI C++ state object, unblock its ready flag:
-          if (status_ptr >= 0x10000 && status_ptr < 0x7F000000) {
+          if (status_ptr >= 0x10000 && status_ptr < 0xFF000000) {
             uint32_t ready_flag_addr = status_ptr + 0x18;
 
             auto* vtable_slot = memory_->TranslateVirtual<uint32_t*>(status_ptr);
             if (vtable_slot) {
               uint32_t vtable_val = xe::load_and_swap<uint32_t>(vtable_slot);
               XELOGI("XamApp: 0x2B001 NUI object +0x00 vtable={:08X}", vtable_val);
+              // If status_ptr is directly an INuiSensor** or device pointer receiving slot (value is 0):
+              if (vtable_val == 0) {
+                xe::memory::PageAccess rp_old;
+                xe::memory::Protect(vtable_slot, 4, xe::memory::PageAccess::kReadWrite, &rp_old);
+                xe::store_and_swap<uint32_t>(vtable_slot, nui_device_addr_);
+                xe::memory::Protect(vtable_slot, 4, rp_old);
+                XELOGI("XamApp: 0x2B001 wrote device {:08X} directly to status_ptr {:08X}",
+                       nui_device_addr_, status_ptr);
+              }
             }
 
             auto* ready_slot = memory_->TranslateVirtual<uint32_t*>(ready_flag_addr);
@@ -399,7 +408,7 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           }
 
           // If hr_ptr is provided, write 0 (S_OK) so the caller's HRESULT check passes:
-          if (hr_ptr >= 0x10000 && hr_ptr < 0x7F000000) {
+          if (hr_ptr >= 0x10000 && hr_ptr < 0xFF000000) {
             auto* hr_slot = memory_->TranslateVirtual<uint32_t*>(hr_ptr);
             if (hr_slot) {
               xe::store_and_swap<uint32_t>(hr_slot, 0);
