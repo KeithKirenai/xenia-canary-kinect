@@ -296,8 +296,16 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
             }
           }
 
-          XELOGI("XamApp: 0x2B001 done: event={:08X} nui_obj={:08X} device={:08X}",
-                 original_handle, status_ptr, nui_device_addr_);
+          // If hr_ptr is provided, write 0 (S_OK) so the caller's HRESULT check passes:
+          if (hr_ptr >= 0x10000 && hr_ptr < 0x7F000000) {
+            auto* hr_slot = memory_->TranslateVirtual<uint32_t*>(hr_ptr);
+            if (hr_slot) {
+              xe::store_and_swap<uint32_t>(hr_slot, 0);
+            }
+          }
+
+          XELOGI("XamApp: 0x2B001 done: event={:08X} nui_obj={:08X} device={:08X} hr_ptr={:08X}",
+                 original_handle, status_ptr, nui_device_addr_, hr_ptr);
         }
       }
       return X_E_SUCCESS;
@@ -432,10 +440,21 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }
       // Attempt to fill with skeleton frame data if KinectInputDriver is ready.
       if (kd() && kd()->is_initialized() && buffer_length >= 40) {
-        // Write success status in first field (after app handle).
+        // Write session handle and success status.
         xe::store_and_swap<uint32_t>(&out[0], 0x000000fe);
         xe::store_and_swap<uint32_t>(&out[1], 0);
-        // Remaining fields left as-is for now; game will check status.
+
+        xe::hid::kinect::X_NUI_SKELETON_FRAME frame{};
+        if (XSUCCEEDED(kd()->NuiSkeletonGetNextFrame(0, &frame))) {
+          // Field 2: timestamp lower 32-bits
+          xe::store_and_swap<uint32_t>(&out[2], static_cast<uint32_t>(frame.liTimeStamp));
+          // Field 3: frame number
+          xe::store_and_swap<uint32_t>(&out[3], frame.dwFrameNumber);
+          // Field 4: tracking state of primary user
+          xe::store_and_swap<uint32_t>(&out[4], static_cast<uint32_t>(frame.SkeletonData[0].eTrackingState));
+          // Field 5: tracking ID
+          xe::store_and_swap<uint32_t>(&out[5], frame.SkeletonData[0].dwTrackingID);
+        }
       }
       return X_E_SUCCESS;
     }

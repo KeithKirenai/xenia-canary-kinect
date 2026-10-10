@@ -125,6 +125,14 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
       if (kd() && kd()->is_initialized() && buffer_length >= 40) {
         xe::store_and_swap<uint32_t>(&out[0], 0x000000fe); // Session handle
         xe::store_and_swap<uint32_t>(&out[1], 0);          // Success status
+
+        xe::hid::kinect::X_NUI_SKELETON_FRAME frame{};
+        if (XSUCCEEDED(kd()->NuiSkeletonGetNextFrame(0, &frame))) {
+          xe::store_and_swap<uint32_t>(&out[2], static_cast<uint32_t>(frame.liTimeStamp));
+          xe::store_and_swap<uint32_t>(&out[3], frame.dwFrameNumber);
+          xe::store_and_swap<uint32_t>(&out[4], static_cast<uint32_t>(frame.SkeletonData[0].eTrackingState));
+          xe::store_and_swap<uint32_t>(&out[5], frame.SkeletonData[0].dwTrackingID);
+        }
       }
       return X_E_SUCCESS;
     }
