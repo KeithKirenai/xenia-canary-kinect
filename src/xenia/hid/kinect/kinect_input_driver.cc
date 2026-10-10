@@ -543,8 +543,13 @@ void KinectInputDriver::PollWindowsSDK() {
 
   uint8_t raw[kWinFrameSize] = {};
   using PfnGet = int(__stdcall*)(uint32_t, void*);
-  if (reinterpret_cast<PfnGet>(win_NuiSkeletonGetNextFrame_)(0, raw) != 0)
+  if (reinterpret_cast<PfnGet>(win_NuiSkeletonGetNextFrame_)(0, raw) != 0) {
+    // If real sensor has not delivered a frame yet or is warming up, fallback to synthetic
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    BuildSyntheticFrame(&frame_latest_);
+    new_frame_ = true;
     return;
+  }
 
   std::lock_guard<std::mutex> lock(frame_mutex_);
   std::memset(&frame_latest_, 0, sizeof(frame_latest_));

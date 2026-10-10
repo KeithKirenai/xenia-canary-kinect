@@ -210,7 +210,7 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           // Allocate guest memory for mock NUI device on first call:
           if (!nui_device_addr_) {
             nui_device_addr_ = memory_->SystemHeapAlloc(4);
-            nui_vtable_addr_ = memory_->SystemHeapAlloc(128);
+            nui_vtable_addr_ = memory_->SystemHeapAlloc(256);
 
             if (nui_device_addr_ && nui_vtable_addr_) {
               // Register COM stubs once:
@@ -226,7 +226,7 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                     memory_->TranslateVirtual<uint32_t*>(nui_vtable_addr_);
                 if (vtable_data) {
                   xe::store_and_swap<uint32_t>(&vtable_data[0], qi_trampoline);
-                  for (int i = 1; i < 32; i++) {
+                  for (int i = 1; i < 64; i++) {
                     xe::store_and_swap<uint32_t>(&vtable_data[i],
                                                  success_trampoline);
                   }
