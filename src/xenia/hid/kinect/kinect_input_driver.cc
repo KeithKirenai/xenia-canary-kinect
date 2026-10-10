@@ -383,7 +383,7 @@ X_RESULT KinectInputDriver::NuiImageStreamOpen(
   }
 
   // Provide synthetic stream handle if real sensor is unavailable
-  *out_stream_handle = reinterpret_cast<void*>(0xCAFE0000 | (image_type & 0xFFFF));
+  *out_stream_handle = reinterpret_cast<void*>(static_cast<uintptr_t>(0xCAFE0000 | (image_type & 0xFFFF)));
   XELOGI("KinectInputDriver: NuiImageStreamOpen synthetic stream handle {:p} (type={})",
          *out_stream_handle, image_type);
   return X_ERROR_SUCCESS;

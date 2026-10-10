@@ -24,7 +24,6 @@
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/vfs/devices/stfs_xbox.h"
-#include "xenia/vfs/devices/xcontent_container_device.h"
 #include "xenia/xbox.h"
 
 DEFINE_int32(
@@ -489,30 +488,10 @@ dword_result_t XamContentOpenFile_entry(
     dword_t user_index, lpstring_t root_name, lpstring_t path, dword_t flags,
     lpdword_t disposition_ptr, lpdword_t license_mask_ptr,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
-  auto entry = kernel_state()->file_system()->ResolvePath(path.value());
-
-  if (!entry) {
-    return X_ERROR_FILE_NOT_FOUND;
-  }
-
-  const std::filesystem::path host_path =
-      kernel_state()->emulator()->content_root() / entry->name();
-
-  if (!std::filesystem::exists(host_path)) {
-    uint64_t progress = 0;
-
-    vfs::VirtualFileSystem::ExtractContentFile(
-        entry, kernel_state()->emulator()->content_root(), progress, true);
-  }
-
-  auto device = vfs::XContentContainerDevice::CreateContentDevice(
-      root_name.value(), host_path);
-  device->Initialize();
-  kernel_state()->file_system()->RegisterDevice(std::move(device));
-
-  return X_ERROR_SUCCESS;
+  // TODO(gibbed): arguments assumed based on XamContentCreate.
+  return X_ERROR_FILE_NOT_FOUND;
 }
-DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kImplemented);
+DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kStub);
 
 dword_result_t XamContentFlush_entry(lpstring_t root_name,
                                      pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
