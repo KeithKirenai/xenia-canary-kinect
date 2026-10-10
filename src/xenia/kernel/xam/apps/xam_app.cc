@@ -411,7 +411,10 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           if (hr_ptr >= 0x10000 && hr_ptr < 0xFF000000) {
             auto* hr_slot = memory_->TranslateVirtual<uint32_t*>(hr_ptr);
             if (hr_slot) {
+              xe::memory::PageAccess hp_old;
+              xe::memory::Protect(hr_slot, 4, xe::memory::PageAccess::kReadWrite, &hp_old);
               xe::store_and_swap<uint32_t>(hr_slot, 0);
+              xe::memory::Protect(hr_slot, 4, hp_old);
             }
           }
 
