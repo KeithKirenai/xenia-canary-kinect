@@ -42,13 +42,34 @@ static int g_nui_com_call_count = 0;
 static void NuiCOMStub_Success(xe::cpu::ppc::PPCContext* context) {
   uint32_t this_ptr = static_cast<uint32_t>(context->r[3]);
   uint32_t method_id = g_nui_com_call_count++;
-  if (method_id < 5) {
-    XELOGI("NuiCOMStub_Success: call #{:d} this={:08X} r3={:08X} r4={:08X}",
+  if (method_id < 20) {
+    XELOGI("NuiCOMStub_Success: call #{:d} this={:08X} r3={:08X} r4={:08X} r5={:08X}",
            method_id, this_ptr,
            static_cast<uint32_t>(context->r[3]),
-           static_cast<uint32_t>(context->r[4]));
+           static_cast<uint32_t>(context->r[4]),
+           static_cast<uint32_t>(context->r[5]));
   }
   context->r[3] = 0; // S_OK / 0
+}
+
+static void NuiCOMStub_NuiStatus(xe::cpu::ppc::PPCContext* context) {
+  // INuiSensor::NuiStatus() -> S_OK (0) if initialized
+  context->r[3] = 0; // S_OK
+}
+
+static void NuiCOMStub_ImageStreamOpen(xe::cpu::ppc::PPCContext* context) {
+  // r3 = this, r4 = eImageType, r5 = eResolution, r6 = flags, r7 = frameLimit, r8 = hNextFrameEvent, r9 = phStreamHandle
+  uint32_t phStreamHandle = static_cast<uint32_t>(context->r[9]);
+  if (phStreamHandle) {
+    auto* out = context->TranslateVirtual<uint32_t*>(phStreamHandle);
+    if (out) {
+      uint32_t fake_handle = 0xCAFE0000 | (static_cast<uint32_t>(context->r[4]) & 0xFFFF);
+      xe::store_and_swap<uint32_t>(out, fake_handle);
+      XELOGI("NuiCOMStub_ImageStreamOpen: returned stream handle {:08X} to {:08X}",
+             fake_handle, phStreamHandle);
+    }
+  }
+  context->r[3] = 0; // S_OK
 }
 
 /* Notes:
@@ -221,6 +242,12 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                 uint32_t success_trampoline =
                     kernel_state_->kernel_trampoline_group()->NewLongtermTrampoline(
                         NuiCOMStub_Success);
+                uint32_t status_trampoline =
+                    kernel_state_->kernel_trampoline_group()->NewLongtermTrampoline(
+                        NuiCOMStub_NuiStatus);
+                uint32_t stream_open_trampoline =
+                    kernel_state_->kernel_trampoline_group()->NewLongtermTrampoline(
+                        NuiCOMStub_ImageStreamOpen);
 
                 auto* vtable_data =
                     memory_->TranslateVirtual<uint32_t*>(nui_vtable_addr_);
@@ -230,6 +257,10 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                     xe::store_and_swap<uint32_t>(&vtable_data[i],
                                                  success_trampoline);
                   }
+                  // Slot 4: NuiImageStreamOpen
+                  xe::store_and_swap<uint32_t>(&vtable_data[4], stream_open_trampoline);
+                  // Slot 27: NuiStatus
+                  xe::store_and_swap<uint32_t>(&vtable_data[27], status_trampoline);
                 }
 
                 auto* device_data =
