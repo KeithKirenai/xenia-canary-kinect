@@ -427,8 +427,10 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
             }
           }
 
-          // Also write mock device directly to out[1] if the buffer itself was expecting the interface pointer:
-          xe::store_and_swap<uint32_t>(&out[1], nui_device_addr_);
+          // Only write mock device to out[1] if out[1] was initially null (i.e. expected as output):
+          if (status_ptr == 0) {
+            xe::store_and_swap<uint32_t>(&out[1], nui_device_addr_);
+          }
 
           // If hr_ptr is provided, write 0 (S_OK) so the caller's HRESULT check passes:
           if (hr_ptr >= 0x10000 && hr_ptr < 0xFF000000) {
