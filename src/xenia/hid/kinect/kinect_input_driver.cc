@@ -364,6 +364,60 @@ X_RESULT KinectInputDriver::NuiCameraGetElevation(int32_t* out) {
   return X_ERROR_SUCCESS;
 }
 
+X_RESULT KinectInputDriver::NuiImageStreamOpen(
+    uint32_t image_type, uint32_t resolution, uint32_t flags,
+    uint32_t frame_limit, void* next_frame_event, void** out_stream_handle) {
+  if (!out_stream_handle) return X_ERROR_INVALID_PARAMETER;
+
+  if (backend_ == Backend::WindowsSDK && win_NuiImageStreamOpen_) {
+    using Pfn = int(__stdcall*)(uint32_t, uint32_t, uint32_t, uint32_t, void*,
+                                void**);
+    int hr = reinterpret_cast<Pfn>(win_NuiImageStreamOpen_)(
+        image_type, resolution, flags, frame_limit, next_frame_event,
+        out_stream_handle);
+    if (hr == 0 && *out_stream_handle) {
+      XELOGI("KinectInputDriver: NuiImageStreamOpen success, handle={:p}",
+             *out_stream_handle);
+      return X_ERROR_SUCCESS;
+    }
+  }
+
+  // Provide synthetic stream handle if real sensor is unavailable
+  *out_stream_handle = reinterpret_cast<void*>(0xCAFE0000 | (image_type & 0xFFFF));
+  XELOGI("KinectInputDriver: NuiImageStreamOpen synthetic stream handle {:p} (type={})",
+         *out_stream_handle, image_type);
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT KinectInputDriver::NuiImageStreamGetNextFrame(
+    void* stream_handle, uint32_t wait_ms, void** out_image_frame) {
+  if (!out_image_frame) return X_ERROR_INVALID_PARAMETER;
+
+  if (backend_ == Backend::WindowsSDK && win_NuiImageStreamGetNextFrame_ &&
+      stream_handle && (reinterpret_cast<uintptr_t>(stream_handle) & 0xFFFF0000) != 0xCAFE0000) {
+    using Pfn = int(__stdcall*)(void*, uint32_t, void**);
+    int hr = reinterpret_cast<Pfn>(win_NuiImageStreamGetNextFrame_)(
+        stream_handle, wait_ms, out_image_frame);
+    if (hr == 0) {
+      return X_ERROR_SUCCESS;
+    }
+  }
+
+  *out_image_frame = nullptr;
+  return X_ERROR_FUNCTION_FAILED;
+}
+
+X_RESULT KinectInputDriver::NuiImageStreamReleaseFrame(void* stream_handle,
+                                                      void* image_frame) {
+  if (backend_ == Backend::WindowsSDK && win_NuiImageStreamReleaseFrame_ &&
+      stream_handle && (reinterpret_cast<uintptr_t>(stream_handle) & 0xFFFF0000) != 0xCAFE0000) {
+    using Pfn = int(__stdcall*)(void*, void*);
+    reinterpret_cast<Pfn>(win_NuiImageStreamReleaseFrame_)(stream_handle,
+                                                           image_frame);
+  }
+  return X_ERROR_SUCCESS;
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic skeleton
 // ---------------------------------------------------------------------------
@@ -518,6 +572,9 @@ bool KinectInputDriver::TryLoadWindowsSDK() {
   bind_optional("NuiSkeletonTrackingEnable", &win_NuiSkeletonTrackingEnable_);
   bind_optional("NuiCameraElevationSetAngle", &win_NuiCameraSetElevation_);
   bind_optional("NuiCameraElevationGetAngle", &win_NuiCameraGetElevation_);
+  bind_optional("NuiImageStreamOpen", &win_NuiImageStreamOpen_);
+  bind_optional("NuiImageStreamGetNextFrame", &win_NuiImageStreamGetNextFrame_);
+  bind_optional("NuiImageStreamReleaseFrame", &win_NuiImageStreamReleaseFrame_);
   XELOGI("KinectInputDriver: Kinect10.dll loaded successfully.");
   return true;
 #else
@@ -532,7 +589,9 @@ void KinectInputDriver::UnloadWindowsSDK() {
   }
   win_NuiInitialize_ = win_NuiShutdown_ = win_NuiSkeletonGetNextFrame_ =
       win_NuiSkeletonTrackingEnable_ = win_NuiCameraSetElevation_ =
-          win_NuiCameraGetElevation_ = nullptr;
+          win_NuiCameraGetElevation_ = win_NuiImageStreamOpen_ =
+              win_NuiImageStreamGetNextFrame_ =
+                  win_NuiImageStreamReleaseFrame_ = nullptr;
 }
 
 void KinectInputDriver::PollWindowsSDK() {

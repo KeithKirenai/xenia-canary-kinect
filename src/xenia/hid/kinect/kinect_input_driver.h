@@ -172,6 +172,14 @@ class KinectInputDriver final : public InputDriver {
   X_RESULT NuiCameraSetElevation(int32_t degrees);
   X_RESULT NuiCameraGetElevation(int32_t* out_degrees);
 
+  // Video / Depth Image Streams
+  X_RESULT NuiImageStreamOpen(uint32_t image_type, uint32_t resolution,
+                              uint32_t flags, uint32_t frame_limit,
+                              void* next_frame_event, void** out_stream_handle);
+  X_RESULT NuiImageStreamGetNextFrame(void* stream_handle, uint32_t wait_ms,
+                                      void** out_image_frame);
+  X_RESULT NuiImageStreamReleaseFrame(void* stream_handle, void* image_frame);
+
   bool is_initialized() const { return initialized_.load(); }
 
   // Skeleton frame event — PollThread signals this when new data is ready.
@@ -240,6 +248,9 @@ class KinectInputDriver final : public InputDriver {
   void* win_NuiSkeletonTrackingEnable_{nullptr};
   void* win_NuiCameraSetElevation_{nullptr};
   void* win_NuiCameraGetElevation_{nullptr};
+  void* win_NuiImageStreamOpen_{nullptr};
+  void* win_NuiImageStreamGetNextFrame_{nullptr};
+  void* win_NuiImageStreamReleaseFrame_{nullptr};
 
   // OpenNI2 / NiTE2 handles and function pointers.
   // We store opaque void* handles so the header stays SDK-free.
