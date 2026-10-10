@@ -259,8 +259,10 @@ X_RESULT KinectInputDriver::NuiInitialize(uint32_t flags) {
   if (initialized_) return X_ERROR_SUCCESS;
 
   if (backend_ == Backend::WindowsSDK) {
+    // Use full flags (0x01 | 0x02 | 0x08 = 0x0B) to activate hardware camera pipelines:
+    uint32_t init_flags = flags | 0x01 | 0x02 | 0x08;
     using PfnInit = int(__stdcall*)(uint32_t);
-    int hr = reinterpret_cast<PfnInit>(win_NuiInitialize_)(flags);
+    int hr = reinterpret_cast<PfnInit>(win_NuiInitialize_)(init_flags);
     if (hr != 0) {
       XELOGW(
           "KinectInputDriver: Kinect10.dll NuiInitialize → {:08X}, "
@@ -268,6 +270,20 @@ X_RESULT KinectInputDriver::NuiInitialize(uint32_t flags) {
           static_cast<uint32_t>(hr));
       backend_ = Backend::Synthetic;
     } else {
+      if (win_NuiImageStreamOpen_) {
+        using PfnOpen = int(__stdcall*)(uint32_t, uint32_t, uint32_t, uint32_t,
+                                        void*, void**);
+        // Open Color stream (type 1 = COLOR, res 2 = 640x480):
+        int hr_color = reinterpret_cast<PfnOpen>(win_NuiImageStreamOpen_)(
+            1, 2, 0, 2, nullptr, &win_color_stream_);
+        XELOGI("KinectInputDriver: NuiImageStreamOpen (Color) hr={:08X}, stream={:p}",
+               static_cast<uint32_t>(hr_color), win_color_stream_);
+        // Open Depth stream (type 0 = DEPTH_AND_PLAYER_INDEX, res 1 = 320x240):
+        int hr_depth = reinterpret_cast<PfnOpen>(win_NuiImageStreamOpen_)(
+            0, 1, 0, 2, nullptr, &win_depth_stream_);
+        XELOGI("KinectInputDriver: NuiImageStreamOpen (Depth) hr={:08X}, stream={:p}",
+               static_cast<uint32_t>(hr_depth), win_depth_stream_);
+      }
       if (win_NuiSkeletonTrackingEnable_) {
         using PfnTrack = int(__stdcall*)(void*, uint32_t);
         int hr2 = reinterpret_cast<PfnTrack>(win_NuiSkeletonTrackingEnable_)(
@@ -313,6 +329,8 @@ void KinectInputDriver::NuiShutdown() {
   if (backend_ == Backend::WindowsSDK && win_NuiShutdown_) {
     using PfnShut = void(__stdcall*)();
     reinterpret_cast<PfnShut>(win_NuiShutdown_)();
+    win_color_stream_ = nullptr;
+    win_depth_stream_ = nullptr;
   }
 
   initialized_ = false;

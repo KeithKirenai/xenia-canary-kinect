@@ -326,11 +326,17 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                     xe::store_and_swap<uint32_t>(&vtable_data[i],
                                                  success_trampoline);
                   }
+                  // INuiSensor method mappings:
+                  // Slot 3: NuiSetFrameEndEvent
                   // Slot 4: NuiImageStreamOpen
                   xe::store_and_swap<uint32_t>(&vtable_data[4], stream_open_trampoline);
-                  // Slot 18: NuiSkeletonGetNextFrame
+                  // Slot 16: NuiSkeletonGetNextFrame (INuiSensor official index 16)
+                  xe::store_and_swap<uint32_t>(&vtable_data[16], skeleton_frame_trampoline);
+                  // Slot 18: alternate index for NuiSkeletonGetNextFrame
                   xe::store_and_swap<uint32_t>(&vtable_data[18], skeleton_frame_trampoline);
-                  // Slot 27: NuiStatus
+                  // Slot 23: NuiStatus (INuiSensor index 23)
+                  xe::store_and_swap<uint32_t>(&vtable_data[23], status_trampoline);
+                  // Slot 27: alternate NuiStatus
                   xe::store_and_swap<uint32_t>(&vtable_data[27], status_trampoline);
                 }
 

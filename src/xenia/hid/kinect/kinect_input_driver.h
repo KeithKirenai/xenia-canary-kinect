@@ -251,6 +251,8 @@ class KinectInputDriver final : public InputDriver {
   void* win_NuiImageStreamOpen_{nullptr};
   void* win_NuiImageStreamGetNextFrame_{nullptr};
   void* win_NuiImageStreamReleaseFrame_{nullptr};
+  void* win_color_stream_{nullptr};
+  void* win_depth_stream_{nullptr};
 
   // OpenNI2 / NiTE2 handles and function pointers.
   // We store opaque void* handles so the header stays SDK-free.
