@@ -636,6 +636,7 @@ void KinectInputDriver::PollWindowsSDK() {
   std::memcpy(&frame_latest_.vFloorClipPlane, raw + 16, 16);
   std::memcpy(&frame_latest_.vNormalToGravity, raw + 32, 16);
 
+  bool has_physical_tracked = false;
   for (uint32_t s = 0; s < kNuiSkeletonCount; ++s) {
     const uint8_t* src = raw + kWinSkelOffset + s * kWinSkelSize;
     auto& dst = frame_latest_.SkeletonData[s];
@@ -648,7 +649,16 @@ void KinectInputDriver::PollWindowsSDK() {
     for (uint32_t j = 0; j < kNuiSkeletonPositionCount; ++j)
       std::memcpy(&dst.eSkeletonPositionTrackingState[j], src + 352 + j * 4, 4);
     std::memcpy(&dst.dwQualityFlags, src + 432, 4);
+    if (dst.eTrackingState == X_NUI_SKELETON_TRACKED) {
+      has_physical_tracked = true;
+    }
   }
+
+  // If physical hardware does not see a standing person right now, seamlessly fall back to synthetic:
+  if (!has_physical_tracked) {
+    BuildSyntheticFrame(&frame_latest_);
+  }
+
   new_frame_ = true;
 #endif
 }
