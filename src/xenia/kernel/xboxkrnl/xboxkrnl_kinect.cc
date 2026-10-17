@@ -48,9 +48,14 @@ dword_result_t PsCamDeviceRequest_entry(
   auto* mem = kernel_state()->memory();
   uint32_t request_code = GetPsCamRequestCode(mem, arg2.value());
 
-  XELOGI("PsCamDeviceRequest [#{}]: arg0={:08X}, arg1={:08X}, arg2={:08X}, arg3={:08X}, arg4={:08X}, arg5={:08X}, req=0x{:X}",
-         ps_cam_call_count, arg0.value(), arg1.value(), arg2.value(),
-         arg3.value(), arg4.value(), arg5.value(), request_code);
+  // NOTE: XELOGD + first-N-only. This is a kHighFrequency call path (the guest
+  // polls it thousands of times per second); logging every call at info level
+  // produced ~950,000 log lines and was a major contributor to log flooding.
+  if (ps_cam_call_count <= 32) {
+    XELOGI("PsCamDeviceRequest [#{}]: arg0={:08X}, arg1={:08X}, arg2={:08X}, arg3={:08X}, arg4={:08X}, arg5={:08X}, req=0x{:X}",
+           ps_cam_call_count, arg0.value(), arg1.value(), arg2.value(),
+           arg3.value(), arg4.value(), arg5.value(), request_code);
+  }
 
   // Dump the output buffer contents for first few calls
   if (arg0.value() >= 0x10000 && arg0.value() < 0xF0000000 && ps_cam_call_count <= 16) {
@@ -98,16 +103,19 @@ dword_result_t PsCamDeviceRequest_entry(
 
   return X_STATUS_SUCCESS;
 }
-DECLARE_XBOXKRNL_EXPORT1(PsCamDeviceRequest, kNone, kStub);
+DECLARE_XBOXKRNL_EXPORT1(PsCamDeviceRequest, kNone, kImplemented);
 
 dword_result_t McaDeviceRequest_entry(
     dword_t request_code, lpvoid_t input_buffer, dword_t input_length,
     lpvoid_t output_buffer, dword_t output_length, lpdword_t bytes_returned) {
-  XELOGI("McaDeviceRequest: code={}, in_len={}, out_len={}", request_code.value(), input_length.value(), output_length.value());
+  static uint32_t mca_call_count = 0;
+  if (++mca_call_count <= 32) {
+    XELOGI("McaDeviceRequest: code={}, in_len={}, out_len={}", request_code.value(), input_length.value(), output_length.value());
+  }
 
   auto* mem = kernel_state()->memory();
 
-  if (input_buffer && input_length.value() > 0 && input_length.value() < 0x1000) {
+  if (mca_call_count <= 32 && input_buffer && input_length.value() > 0 && input_length.value() < 0x1000) {
     auto* in = mem->TranslateVirtual<uint8_t*>(input_buffer.guest_address());
     if (in) {
       uint32_t len = std::min<uint32_t>(input_length.value(), 32);
@@ -138,16 +146,19 @@ dword_result_t McaDeviceRequest_entry(
   }
   return X_STATUS_SUCCESS;
 }
-DECLARE_XBOXKRNL_EXPORT1(McaDeviceRequest, kNone, kStub);
+DECLARE_XBOXKRNL_EXPORT1(McaDeviceRequest, kNone, kImplemented);
 
 dword_result_t DetroitDeviceRequest_entry(
     dword_t request_code, lpvoid_t input_buffer, dword_t input_length,
     lpvoid_t output_buffer, dword_t output_length, lpdword_t bytes_returned) {
-  XELOGI("DetroitDeviceRequest: code={}, in_len={}, out_len={}", request_code.value(), input_length.value(), output_length.value());
+  static uint32_t detroit_call_count = 0;
+  if (++detroit_call_count <= 32) {
+    XELOGI("DetroitDeviceRequest: code={}, in_len={}, out_len={}", request_code.value(), input_length.value(), output_length.value());
+  }
 
   auto* mem = kernel_state()->memory();
 
-  if (input_buffer && input_length.value() > 0 && input_length.value() < 0x1000) {
+  if (detroit_call_count <= 32 && input_buffer && input_length.value() > 0 && input_length.value() < 0x1000) {
     auto* in = mem->TranslateVirtual<uint8_t*>(input_buffer.guest_address());
     if (in) {
       uint32_t len = std::min<uint32_t>(input_length.value(), 32);
@@ -178,7 +189,12 @@ dword_result_t DetroitDeviceRequest_entry(
   }
   return X_STATUS_SUCCESS;
 }
-DECLARE_XBOXKRNL_EXPORT1(DetroitDeviceRequest, kNone, kStub);
+DECLARE_XBOXKRNL_EXPORT1(DetroitDeviceRequest, kNone, kImplemented);
+
+// Without this, and the matching XE_MODULE_EXPORT_GROUP(xboxkrnl, Kinect) in
+// xboxkrnl_module_export_groups.inc, the exports above are never registered and
+// every guest call to PsCamDeviceRequest resolves to "undefined extern call".
+DECLARE_XBOXKRNL_EMPTY_REGISTER_EXPORTS(Kinect);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

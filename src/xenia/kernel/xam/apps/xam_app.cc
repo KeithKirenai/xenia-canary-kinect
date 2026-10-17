@@ -9,13 +9,21 @@
 
 #include "xenia/kernel/xam/apps/xam_app.h"
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <vector>
+
 #include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/kernel_module.h"
+#include "xenia/kernel/diagnostics_dump.h"
 #include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/hid/kinect/kinect_input_driver.h"
 #include "xenia/base/memory.h"
 #include "xenia/kernel/xthread.h"
+#include "xenia/kernel/user_module.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/kernel/xevent.h"
@@ -24,6 +32,39 @@
 static xe::hid::kinect::KinectInputDriver* kd() {
   return xe::hid::kinect::KinectInputDriver::instance();
 }
+
+DEFINE_bool(nui_clone_stream_template, false,
+            "On a follow-up 0x2B001, copy the NUI object template captured from "
+            "the first call into the fresh object instead of skipping it. The "
+            "kernel is expected to populate that struct and the call is "
+            "ignored today.",
+            "XAM");
+
+DEFINE_int32(nui_notify_hardware_delay, 10,
+           "Seconds after the 0x2B001 bind before broadcasting "
+           "kXNotificationSystemNUIHardwareStatusChanged. The title polls "
+           "XamNuiGetDeviceStatus exactly once and then parks its NUI worker "
+           "threads on an event, so it needs a status-change notification to "
+           "start the skeleton stream. Broadcasting straight from the 0x2B001 "
+           "handler wedged the title on the splash, hence the delay. -1 "
+           "disables.",
+           "XAM");
+DEFINE_int32(nui_notify_hardware_state, 1,
+           "device_state value passed to the NUI hardware status notification.",
+           "XAM");
+
+DEFINE_bool(nui_mock_device, true,
+            "Fabricate a mock INuiSensor COM device for XAM message 0x2B001. "
+            "Set false to reproduce upstream (no-Kinect) behaviour.",
+            "XAM");
+
+DEFINE_bool(nui_nui_write_shared_frame_buffer, false,
+            "Write skeleton frames directly into the guest buffer passed in "
+            "out[7] of XAM message 0x2B001. EXPERIMENTAL, OFF by default: the "
+            "page is writable and mapped, but writing there makes Kinect "
+            "Adventures hang, so the frame layout the title expects at that "
+            "address is not yet confirmed. Only enable for debugging.",
+            "XAM");
 
 static void NuiCOMStub_QueryInterface(xe::cpu::ppc::PPCContext* context) {
   uint32_t ppvObject = static_cast<uint32_t>(context->r[5]);
@@ -74,7 +115,32 @@ static void NuiCOMStub_ImageStreamOpen(xe::cpu::ppc::PPCContext* context) {
 
 static void NuiCOMStub_SkeletonGetNextFrame(xe::cpu::ppc::PPCContext* context) {
   // r3 = this, r4 = dwMillisecondsToWait, r5 = pSkeletonFrame
+  static std::atomic<uint64_t> skel_calls{0};
+  uint64_t n = skel_calls.fetch_add(1);
   uint32_t frame_ptr = static_cast<uint32_t>(context->r[5]);
+  if (n < 5 || n % 300 == 299) {
+    XELOGI("NuiCOMStub_SkeletonGetNextFrame #{}: this={:08X} wait={} frame_ptr={:08X}",
+           n + 1, static_cast<uint32_t>(context->r[3]),
+           static_cast<uint32_t>(context->r[4]), frame_ptr);
+  }
+  {
+    // Diagnostic: dump the first skeleton entry right after serialization so
+    // guest-side decoding mismatches are visible in the host log.
+    static std::atomic<uint64_t> dump_count{0};
+    uint64_t d = dump_count.fetch_add(1);
+    if (d < 3 || d == 600) {
+      xe::hid::kinect::X_NUI_SKELETON_FRAME probe{};
+      if (kd() && kd()->is_initialized()) {
+        std::ignore = kd()->NuiSkeletonGetNextFrame(0, &probe);
+      }
+      XELOGI("NuiSkeletonGetNextFrame dump #{}: frame={} state0={} id0={} pos=({:f},{:f},{:f})",
+             d + 1, probe.dwFrameNumber,
+             static_cast<int>(probe.SkeletonData[0].eTrackingState),
+             probe.SkeletonData[0].dwTrackingID,
+             probe.SkeletonData[0].Position.x, probe.SkeletonData[0].Position.y,
+             probe.SkeletonData[0].Position.z);
+    }
+  }
   if (frame_ptr && kd() && kd()->is_initialized()) {
     xe::hid::kinect::X_NUI_SKELETON_FRAME host_frame{};
     if (XSUCCEEDED(kd()->NuiSkeletonGetNextFrame(0, &host_frame))) {
@@ -256,8 +322,15 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x00021012: {
+      // XamEnableGuestSignin.
+      //
+      // NOTE: this used to hardcode three guessed event handles (0xF80001AC /
+      // 0xF80001B4 / 0xF80001E0) and force-set them, on the assumption they were
+      // NUI sync events. That is unsound -- it signals guest objects nobody asked
+      // us to signal -- and it ran unconditionally. Removing it lets the guest's
+      // own signalling run untouched, which is what upstream does.
       uint32_t enabled = xe::load_and_swap<uint32_t>(buffer);
-      XELOGD("XEnableGuestSignin: {}", enabled ? "true" : "false");
+      XELOGD("XamApp: XamEnableGuestSignin: {}", enabled ? "true" : "false");
       return X_E_SUCCESS;
     }
     case 0x00022005: {
@@ -276,26 +349,104 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     }
     case 0x0002B001: {
       // NUI device initialization via XMsgInProcessCall.
-      if (buffer_ptr) {
+      {
+        // Diagnostic: the sender is the guest's XAM module, not the title, and
+        // it is what decides whether skeleton tracking ever gets enabled. Log
+        // the return address so we can disassemble the code that builds this
+        // message and read the real contract instead of guessing at the
+        // argument layout.
+        auto* t = XThread::GetCurrentThread();
+        uint32_t lr = 0;
+        if (t && t->thread_state() && t->thread_state()->context()) {
+          lr = static_cast<uint32_t>(t->thread_state()->context()->lr);
+        }
+        static std::atomic<uint64_t> arg_dumps{0};
+        if (arg_dumps.fetch_add(1) < 2) {
+          XELOGI("XamApp: 0x2B001 sender tid={:08X} lr={:08X}", t ? t->thread_id() : 0, lr);
+          if (lr > 0x82000000 && lr < 0x84000000) {
+            uint32_t base = lr & ~static_cast<uint32_t>(0xFFFFF);
+            ::xe::kernel::DumpGuestImageForDiagnostics("guest_xam_msg.bin",
+                                                      base, 0x200000u);
+          }
+          // XAM keeps its stream descriptors in its own address space
+          // (0x7018xxxx). out[4] points at one of them and out[4] of a
+          // follow-up call points at the next entry of the same list, so
+          // dumping that page shows the whole table: how many streams exist,
+          // which one is the skeleton stream, and what it expects back.
+          ::xe::kernel::DumpGuestImageForDiagnostics("guest_xam_desc.bin",
+                                                    0x70180000u, 0x10000u);
+          // XAM's own code lives outside the title image (no reference to
+          // 0x2B001 exists anywhere in 0x82000000-0x83FFFFFF), so dump the
+          // high guest region to locate the code that builds this message and
+          // read the real contract.
+          // XAM's own code lives outside the title image (no reference to
+          // 0x2B001 exists anywhere in 0x82000000-0x85FFFFFF), so ask the
+          // module where its sections actually are and dump them. Reading the
+          // contract from XAM's NUI code is the only way left to learn how
+          // frames are supposed to reach the title.
+          auto xam_mod = kernel_state_->GetKernelModule("xam.xex");
+          XELOGI("XamModule lookup -> {}", xam_mod ? "found" : "NULL");
+          if (xam_mod) {
+            static const char* kSections[] = {".text", "_TEXT", ".rdata",
+                                              ".data"};
+            for (const char* sec : kSections) {
+              uint32_t data_addr = 0;
+              uint32_t data_size = 0;
+              if (xam_mod->GetSection(sec, &data_addr, &data_size) &&
+                  data_size > 0) {
+                XELOGI("XamSection {}: {:08X} size {:08X}", sec, data_addr,
+                       data_size);
+                if (data_addr >= 0x80000000 && data_addr < 0x90000000 &&
+                    data_size <= 0x2000000) {
+                  ::xe::kernel::DumpGuestImageForDiagnostics(
+                      "guest_xam_hi.bin", data_addr, data_size);
+                }
+              }
+            }
+          }
+        }
+      }
+      if (buffer_ptr && buffer_length >= 4) {
+        // How many dwords the title actually declared. NEVER read or write
+        // past this: see the contract note below.
+        const uint32_t declared_dwords = buffer_length / 4;
         auto* out = memory_->TranslateVirtual<uint32_t*>(buffer_ptr);
         if (out) {
-          XELOGI("XamApp: 0x2B001 raw buffer content: {:08X} {:08X} {:08X} {:08X} "
-                 "{:08X} {:08X} {:08X} {:08X}",
-                 xe::byte_swap(out[0]), xe::byte_swap(out[1]),
-                 xe::byte_swap(out[2]), xe::byte_swap(out[3]),
-                 xe::byte_swap(out[4]), xe::byte_swap(out[5]),
-                 xe::byte_swap(out[6]), xe::byte_swap(out[7]));
+          // 0x2B001 carries a SINGLE dword in the shipping title. Verified from
+          // the guest caller at 0x831AEF60:
+          //     stw  r3, 0x50(r1)          ; the one argument
+          //     lis  r4, 2 / ori r4,0xb001 ; msg = 0x2B001
+          //     li   r3, 0xFE              ; app = XAM
+          //     bl   XMsgSystemProcessCall(0xFE, 0x2B001, r1+0x50, 4)
+          // Kinect Adventures declares buffer_length = 4 and passes r3 = an
+          // XObject handle (0x0001D4C0 on the first call, 0 on the second --
+          // and the 0 case is a *deregister* taken on a failure path, not a
+          // second stream registration). Neither call site reads the buffer
+          // back.
+          //
+          // This handler used to dump and write 8 dwords unconditionally. Only
+          // out[0] is the message; out[1..7] are the caller's *stack locals*.
+          // That is why out[2] kept coming out as a link register (0x82A55BF8,
+          // 0x82B05544) and out[1] as an address inside the live frame -- and
+          // why the fabricated "NUI state object" writes and the S_OK store
+          // were corrupting the title's stack and the very instruction it
+          // returns to. Respect the declared length from here on.
+          XELOGI("XamApp: 0x2B001 arg={:08X} (declared buffer_len={}, {} dword(s))",
+                 xe::byte_swap(out[0]), buffer_length, declared_dwords);
+          if (declared_dwords > 1) {
+            XELOGI("XamApp: 0x2B001 extended buffer: {:08X} {:08X} {:08X} {:08X}",
+                   xe::byte_swap(out[0]), xe::byte_swap(out[1]),
+                   xe::byte_swap(out[2]), xe::byte_swap(out[3]));
+          }
 
-          uint32_t original_handle = xe::byte_swap(out[0]);
-          uint32_t status_ptr = xe::byte_swap(out[1]);
-          uint32_t hr_ptr = xe::byte_swap(out[2]);
+          uint32_t arg_val = xe::byte_swap(out[0]);
 
-          if (kd() && !kd()->is_initialized()) {
+          if (kd() && !kd()->is_initialized() && cvars::nui_mock_device) {
             kd()->NuiInitialize(0x08);
           }
 
           // Allocate guest memory for mock NUI device on first call:
-          if (!nui_device_addr_) {
+          if (!nui_device_addr_ && cvars::nui_mock_device) {
             nui_device_addr_ = memory_->SystemHeapAlloc(4);
             nui_vtable_addr_ = memory_->SystemHeapAlloc(256);
 
@@ -328,9 +479,13 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                   }
                   // Slot 4: NuiImageStreamOpen
                   xe::store_and_swap<uint32_t>(&vtable_data[4], stream_open_trampoline);
-                  // Slot 18: NuiSkeletonGetNextFrame
+                  // Slot 16: NuiSkeletonGetNextFrame (standard INuiSensor interface index)
+                  xe::store_and_swap<uint32_t>(&vtable_data[16], skeleton_frame_trampoline);
+                  // Slot 18: NuiSkeletonGetNextFrame (alternate interface index)
                   xe::store_and_swap<uint32_t>(&vtable_data[18], skeleton_frame_trampoline);
-                  // Slot 27: NuiStatus
+                  // Slot 23: NuiStatus (standard INuiSensor interface index)
+                  xe::store_and_swap<uint32_t>(&vtable_data[23], status_trampoline);
+                  // Slot 27: NuiStatus (alternate interface index)
                   xe::store_and_swap<uint32_t>(&vtable_data[27], status_trampoline);
                 }
 
@@ -351,14 +506,14 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
             }
           }
 
-          // Signal and register the notification event:
-          if (original_handle && original_handle < 0x7FFFFFFF) {
+          // If the argument looks like an Event handle (e.g. 0x0001D4C0):
+          if (arg_val > 0 && arg_val < 0x00020000) {
             auto object =
-                kernel_state_->object_table()->LookupObject<XObject>(original_handle);
-            if (!object && original_handle == 0x3E8) {
+                kernel_state_->object_table()->LookupObject<XObject>(arg_val);
+            if (!object) {
               auto ev = object_ref<XEvent>(new XEvent(kernel_state_));
               ev->Initialize(true, false);
-              kernel_state_->object_table()->RestoreHandle(original_handle, ev.get());
+              kernel_state_->object_table()->RestoreHandle(arg_val, ev.get());
               object = ev;
             }
             if (object) {
@@ -369,7 +524,7 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                   kd()->SetSkeletonFrameEvent(ev);
                 }
                 XELOGI("XamApp: 0x2B001 signaled and registered Event handle {:08X}",
-                       original_handle);
+                       arg_val);
               } else if (object->type() == XObject::Type::Semaphore) {
                 auto sem = static_cast<xe::kernel::XSemaphore*>(object.get());
                 std::ignore = sem->ReleaseSemaphore(1, nullptr);
@@ -377,37 +532,79 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
             }
           }
 
-          // If status_ptr points to a guest NUI C++ state object, unblock its ready flag:
-          if (status_ptr >= 0x10000 && status_ptr < 0xFF000000) {
-            uint32_t ready_flag_addr = status_ptr + 0x18;
+          // Periodic hardware status broadcaster to notify title when sensor is ready:
+          {
+            static std::atomic<bool> notifying{false};
+            if (kd() && !notifying.exchange(true)) {
+              std::thread([this]() {
+                for (int tick = 0; tick < 45; ++tick) {
+                  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                  if (cvars::nui_notify_hardware_delay >= 0 &&
+                      tick == cvars::nui_notify_hardware_delay) {
+                    kernel_state_->BroadcastNotification(
+                        kXNotificationSystemNUIHardwareStatusChanged,
+                        static_cast<uint32_t>(cvars::nui_notify_hardware_state));
+                    XELOGI(
+                        "XamApp: broadcast NUIHardwareStatusChanged state={} "
+                        "at t+{}s",
+                        cvars::nui_notify_hardware_state, tick);
+                  }
+                }
+              }).detach();
+            }
+          }
 
+          // out[1]/out[2] are only meaningful when the title actually declared
+          // them. The 32-byte test harness passes a real struct and relies on
+          // both; Kinect Adventures declares 4 bytes and the "values" there are
+          // its stack, so touching them corrupts live guest state.
+          const bool extended = declared_dwords >= 3;
+          uint32_t status_ptr = extended ? xe::byte_swap(out[1]) : 0;
+          uint32_t hr_ptr = extended ? xe::byte_swap(out[2]) : 0;
+
+          // A device out-slot: if out[1] is an empty pointer slot, publish the
+          // mock INuiSensor there. Only reachable when the title declared the
+          // slot, so this cannot fire for the 4-byte shipping contract.
+          if (extended && status_ptr >= 0x10000 && status_ptr < 0xFF000000) {
             auto* vtable_slot = memory_->TranslateVirtual<uint32_t*>(status_ptr);
             if (vtable_slot) {
               uint32_t vtable_val = xe::load_and_swap<uint32_t>(vtable_slot);
-              XELOGI("XamApp: 0x2B001 NUI object +0x00 vtable={:08X}", vtable_val);
-              // If status_ptr is directly an INuiSensor** or device pointer receiving slot (value is 0):
+              XELOGI("XamApp: 0x2B001 device slot {:08X} current={:08X}",
+                     status_ptr, vtable_val);
               if (vtable_val == 0) {
                 xe::memory::PageAccess rp_old;
                 xe::memory::Protect(vtable_slot, 4, xe::memory::PageAccess::kReadWrite, &rp_old);
                 xe::store_and_swap<uint32_t>(vtable_slot, nui_device_addr_);
                 xe::memory::Protect(vtable_slot, 4, rp_old);
-                XELOGI("XamApp: 0x2B001 wrote device {:08X} directly to status_ptr {:08X}",
+                XELOGI("XamApp: 0x2B001 published device {:08X} to out[1] {:08X}",
                        nui_device_addr_, status_ptr);
               }
             }
-
-            auto* ready_slot = memory_->TranslateVirtual<uint32_t*>(ready_flag_addr);
-            if (ready_slot) {
-              xe::memory::PageAccess rp_old;
-              xe::memory::Protect(ready_slot, 4, xe::memory::PageAccess::kReadWrite, &rp_old);
-              xe::store_and_swap<uint32_t>(ready_slot, nui_device_addr_);
-              xe::memory::Protect(ready_slot, 4, rp_old);
-              XELOGI("XamApp: 0x2B001 wrote device {:08X} to NUI ready_flag {:08X}",
-                     nui_device_addr_, ready_flag_addr);
-            }
           }
 
-          // If hr_ptr is provided, write 0 (S_OK) so the caller's HRESULT check passes:
+          // REMOVED: the "NUI C++ state object" writes at out[1]+0x18,
+          // +0x70 and +0x6CF0, plus forcing bytes[0..5], bytes[9] and the
+          // +0x10 mask to 1. For Kinect Adventures out[1] is the caller's
+          // stack local (r1+0x54), so this fabricated a ~28 KB state machine
+          // inside the live frame and adjacent heap, gated by an address-shape
+          // heuristic ("vtable looks like 0x100 or is in .text"). The title
+          // never observed any of it. With out[1] now gated on a declared
+          // 32-byte buffer this path is unreachable for the 4-byte contract,
+          // and deleting it removes the last stack corruption on this message.
+          //
+          // Also gone: registering a "shared skeleton buffer" at
+          // status_ptr + 0x17D00 and a "master device queue object" at the
+          // hardcoded address 0x83896510 (into which the driver wrote an
+          // invented +0x00/+0x58/+0xA40 layout every frame). Both were
+          // derived from stack garbage, and both are the "fabricate a write
+          // target from an address heuristic" mistake that froze the title on
+          // 2026-10-13. Skeleton data must enter a title through a contract
+          // the title itself established, not a structure we invented.
+
+          // HRESULT out-slot, only when the title declared one. For the
+          // 4-byte shipping contract hr_ptr stays 0 and we write nothing --
+          // previously this stored S_OK over 0x82A55BF8, the caller's link
+          // register, i.e. straight into its own code.
           if (hr_ptr >= 0x10000 && hr_ptr < 0xFF000000) {
             auto* hr_slot = memory_->TranslateVirtual<uint32_t*>(hr_ptr);
             if (hr_slot) {
@@ -415,11 +612,12 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
               xe::memory::Protect(hr_slot, 4, xe::memory::PageAccess::kReadWrite, &hp_old);
               xe::store_and_swap<uint32_t>(hr_slot, 0);
               xe::memory::Protect(hr_slot, 4, hp_old);
+              XELOGI("XamApp: 0x2B001 wrote S_OK to out[2] {:08X}", hr_ptr);
             }
           }
 
-          XELOGI("XamApp: 0x2B001 done: event={:08X} nui_obj={:08X} device={:08X} hr_ptr={:08X}",
-                 original_handle, status_ptr, nui_device_addr_, hr_ptr);
+          XELOGI("XamApp: 0x2B001 done: arg={:08X} extended={} device={:08X}",
+                 arg_val, extended ? 1 : 0, nui_device_addr_);
         }
       }
       return X_E_SUCCESS;
@@ -481,10 +679,43 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     case 0x00021030: {
       return X_E_SUCCESS;
     }
+    case 0x0002C001: {
+      // NUI identity notification / status event.
+      // Buffer contains: [code (4 bytes), param (8 bytes), ...]
+      auto* raw = memory_->TranslateVirtual<uint32_t*>(buffer_ptr);
+      if (raw && buffer_length >= 4) {
+        uint32_t code = xe::load_and_swap<uint32_t>(&raw[0]);
+        uint32_t p1 = (buffer_length >= 8) ? xe::load_and_swap<uint32_t>(&raw[1]) : 0;
+        uint32_t p2 = (buffer_length >= 12) ? xe::load_and_swap<uint32_t>(&raw[2]) : 0;
+        XELOGI("XamApp: 0x2C001 NUI event code={:08X} (p1={:08X}, p2={:08X}, len={})",
+               code, p1, p2, buffer_length);
+      } else {
+        XELOGI("XamApp: 0x2C001 NUI event (buf={:08X}, len={})", buffer_ptr, buffer_length);
+      }
+      return X_E_SUCCESS;
+    }
     case 0x0002C009: {
       // Registers (non-zero) or removes (zero) a Kinect identity callback.
       if (!buffer_ptr) {
         return X_E_INVALIDARG;
+      }
+      uint32_t callback = xe::load_and_swap<uint32_t>(buffer);
+      // Dump the full 32-byte message so we can see the callback context
+      // (real XAM invokes this with a context pointer + status).
+      if (memory_) {
+        auto* raw = memory_->TranslateVirtual<uint32_t*>(buffer_ptr);
+        if (raw) {
+          XELOGI(
+              "XamApp: 0x2C009 buffer: cb={:08X} ctx={:08X} w2={:08X} w3={:08X} "
+              "w4={:08X} w5={:08X} w6={:08X} w7={:08X}",
+              callback, xe::load_and_swap<uint32_t>(&raw[1]),
+              xe::load_and_swap<uint32_t>(&raw[2]),
+              xe::load_and_swap<uint32_t>(&raw[3]),
+              xe::load_and_swap<uint32_t>(&raw[4]),
+              xe::load_and_swap<uint32_t>(&raw[5]),
+              xe::load_and_swap<uint32_t>(&raw[6]),
+              xe::load_and_swap<uint32_t>(&raw[7]));
+        }
       }
       XELOGI("XamApp: 0x2C009 Kinect identity callback {:08X}",
              xe::load_and_swap<uint32_t>(buffer));
@@ -581,6 +812,32 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
            X_PC_FLAGS::PCEnabled) != 0;
 
       return is_pc_enabled ? X_E_ACCESS_DENIED : X_E_SUCCESS;
+    }
+    // Biometric (face/fingerprint) data read request. Kinect Adventures sends
+    // this during startup. There is no biometric hardware on the host, so
+    // report "success, zero bytes available" rather than failing -- the game
+    // otherwise stalls. The buffer is only touched when the caller actually
+    // supplied a valid one; the arguments here come from the guest unchecked.
+    // Biometric (face/fingerprint) data read request. Kinect Adventures sends
+    // this during startup. There is no biometric hardware on the host, so
+    // report "success, zero bytes available" rather than failing -- the game
+    // otherwise stalls. The buffer is only touched when the caller actually
+    // supplied a valid one; the arguments here come from the guest unchecked.
+    case 0x0002A004:  // Biometric session context init.
+    case 0x0002A005:  // Biometric session/query open.
+    case 0x0002A006:  // Biometric session/query close.
+    case 0x0002A007:  // Biometric enumerate/read (24-byte records).
+    case 0x0002A008: {
+      static uint32_t bio_msg_count = 0;
+      if (++bio_msg_count <= 16) {
+        // Log with the actual message id so sequences stay readable.
+        XELOGI("XamApp: biometric request msg={:06X} buf={:08X} len={}",
+               message, buffer_ptr, buffer_length);
+      }
+      if (buffer && buffer_length && buffer_length <= 0x1000) {
+        std::memset(buffer, 0, buffer_length);
+      }
+      return X_E_SUCCESS;
     }
   }
   XELOGE(

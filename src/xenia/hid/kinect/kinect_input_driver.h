@@ -69,6 +69,8 @@
 namespace xe {
 namespace kernel {
 class XEvent;
+class XSemaphore;
+class XTimer;
 }  // namespace kernel
 namespace hid {
 namespace kinect {
@@ -93,7 +95,7 @@ enum X_NUI_SKELETON_POSITION_TRACKING_STATE : uint32_t {
   X_NUI_SKELETON_POSITION_TRACKED = 2,
 };
 
-// Joint indices — same order as Windows Kinect SDK 1.x / XDK.
+// Joint indices — standard Xbox 360 NUI skeleton layout.
 enum X_NUI_SKELETON_POSITION_INDEX : uint32_t {
   NUI_JOINT_HIP_CENTER = 0,
   NUI_JOINT_SPINE,
@@ -185,6 +187,20 @@ class KinectInputDriver final : public InputDriver {
   // Skeleton frame event — PollThread signals this when new data is ready.
   // The game creates an XEvent and waits on it; we signal it at 30fps.
   void SetSkeletonFrameEvent(xe::kernel::XEvent* event);
+  void AddSyncEvent(xe::kernel::XEvent* event);
+  // Registers an event the title created itself for its NUI worker queue.
+  // Woken on every produced frame so the title's NUI workers can drain it.
+  void AddNuiWakeEvent(xe::kernel::XEvent* event);
+  void AddSyncSemaphore(xe::kernel::XSemaphore* sem);
+  void AddSyncTimer(xe::kernel::XTimer* timer);
+
+  // Set guest shared memory address where frames should be written directly
+  void SetSharedSkeletonBuffer(uint8_t* guest_dst) { shared_guest_dst_ = guest_dst; }
+  void SetSharedSkeletonBuffer2(uint8_t* guest_dst) { shared_guest_dst2_ = guest_dst; }
+  // Note: there is deliberately no SetNuiDeviceObject(). The "device object" it
+  // fed was a hardcoded guest address (0x83896510) paired with an invented
+  // layout, and writing it corrupted live guest memory every frame. See the
+  // removal note in kinect_input_driver.cc.
 
  private:
   // Synthetic skeleton (always available, no hardware needed).
@@ -230,6 +246,17 @@ class KinectInputDriver final : public InputDriver {
   uint32_t skeleton_event_handle_{0};  // XEvent handle to signal on new frame
   // Host event to signal
   xe::kernel::XEvent* skeleton_xevent_{nullptr};
+  std::vector<xe::kernel::XEvent*> sync_events_;
+
+  // Events the title creates itself for its NUI worker queue (after the
+  // 0x2B001 bind, so they cannot be registered from a message handler). These
+  // are woken every produced frame.
+  std::vector<xe::kernel::XEvent*> nui_wake_events_;
+  std::vector<xe::kernel::XSemaphore*> sync_semaphores_;
+  std::vector<xe::kernel::XTimer*> sync_timers_;
+  std::mutex sync_events_mutex_;
+  std::atomic<uint8_t*> shared_guest_dst_{nullptr};
+  std::atomic<uint8_t*> shared_guest_dst2_{nullptr};
 
   enum class Backend {
     None,

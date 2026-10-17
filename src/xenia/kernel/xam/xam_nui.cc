@@ -9,6 +9,7 @@
 
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
+#include "xenia/kernel/diagnostics_dump.h"
 #include "xenia/kernel/kernel_flags.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -57,6 +58,12 @@ static_assert(sizeof(X_NUI_DEVICE_STATUS) == 24, "Size matters");
 // Get
 dword_result_t XamNuiGetDeviceStatus_entry(
     pointer_t<X_NUI_DEVICE_STATUS> status_ptr) {
+  static std::atomic<uint64_t> calls{0};
+  uint64_t n = calls.fetch_add(1);
+  if (n < 5 || n % 1000 == 999) {
+    XELOGI("XamNuiGetDeviceStatus called (n={}, tid={:08X})", n + 1,
+           XThread::GetCurrentThread() ? XThread::GetCurrentThread()->thread_id() : 0);
+  }
   /* Notes:
      - it does return a value that is not always used
      - returns values are X_ERROR_SUCCESS, 0xC0050006, and others
@@ -70,6 +77,20 @@ dword_result_t XamNuiGetDeviceStatus_entry(
   */
 
   status_ptr.Zero();
+
+  // One-shot guest image dump on the first status query. Titles that use the
+  // XAM NUI service (instead of the INuiSensor COM device) ask for device
+  // status exactly once and then park their NUI worker threads on an event, so
+  // this is the only reliable point to snapshot their NUI runtime for
+  // offline disassembly. The XEX image is decompressed in guest RAM by then.
+  {
+    static std::atomic<bool> dumped{false};
+    if (!dumped.exchange(true)) {
+      ::xe::kernel::DumpGuestImageForDiagnostics("guest_nui_dump.bin",
+                                                 0x82000000u, 0x2000000u);
+    }
+  }
+
   if (!cvars::allow_nui_initialization) {
     return 0xC0050006;
   }
@@ -79,19 +100,21 @@ dword_result_t XamNuiGetDeviceStatus_entry(
     kd()->NuiInitialize(0x08);  // NUI_INITIALIZE_FLAG_USES_SKELETON
   }
   if (kd() && kd()->is_initialized()) {
-    // status = 0x45 means device ready + sensor connected + motor connected
-    status_ptr->status = 0x45u;
+    // status = 0x47 means device ready + sensor connected + motor connected + streams ready (bit 0x1E)
+    status_ptr->status = 0x47u;
   }
   return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamNuiGetDeviceStatus, kNone, kStub);
+DECLARE_XAM_EXPORT1(XamNuiGetDeviceStatus, kNone, kImplemented);
 
 dword_result_t XamUserNuiGetUserIndex_entry(unknown_t unk, lpdword_t index) {
-  XELOGI("XamUserNuiGetUserIndex called");
-  if (index) { *index = 0; }
+  XELOGI("XamUserNuiGetUserIndex called (unk={})", uint32_t(unk));
+  if (index) {
+    *index = 0;
+  }
   return X_E_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamUserNuiGetUserIndex, kNone, kStub);
+DECLARE_XAM_EXPORT1(XamUserNuiGetUserIndex, kNone, kImplemented);
 
 dword_result_t XamUserNuiGetUserIndexForSignin_entry(lpdword_t index) {
   XELOGI("XamUserNuiGetUserIndexForSignin called");
@@ -168,27 +191,32 @@ DECLARE_XAM_EXPORT1(XamNuiHudGetEngagedEnrollmentIndex, kNone, kStub);
 
 dword_result_t XamNuiCameraTiltGetStatus_entry(lpvoid_t unk) {
   if (unk) {
-    std::memset(kernel_memory()->TranslateVirtual(unk.guest_address()), 0, 0x50);
+    // TranslateVirtual returns nullptr for unmapped guest addresses; memset
+    // over that would fault the host.
+    auto* dst = kernel_memory()->TranslateVirtual(unk.guest_address());
+    if (dst) {
+      std::memset(dst, 0, 0x50);
+    }
   }
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamNuiCameraTiltGetStatus, kNone, kStub);
 
-dword_result_t XamNuiCameraElevationGetAngle_entry(lpqword_t unk1,
-                                                   lpdword_t unk2) {
+dword_result_t XamNuiCameraElevationGetAngle_entry(lpdword_t angle_out,
+                                                   lpdword_t flags_out) {
   int32_t angle = 0;
   if (kd()) {
     kd()->NuiCameraGetElevation(&angle);
   }
-  if (unk2) {
-    *unk2 = static_cast<uint32_t>(angle);
+  if (angle_out) {
+    *angle_out = static_cast<uint32_t>(angle);
   }
-  if (unk1) {
-    *unk1 = static_cast<uint64_t>(angle);
+  if (flags_out) {
+    *flags_out = 0;
   }
   return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamNuiCameraElevationGetAngle, kNone, kStub);
+DECLARE_XAM_EXPORT1(XamNuiCameraElevationGetAngle, kNone, kImplemented);
 
 dword_result_t XamNuiCameraGetTiltControllerType_entry() {
   return 1; // 1 = Motor tilt controller connected
@@ -221,6 +249,12 @@ dword_result_t XamIsNuiUIActive_entry() {
 DECLARE_XAM_EXPORT1(XamIsNuiUIActive, kNone, kImplemented);
 
 dword_result_t XamNuiIsDeviceReady_entry() {
+  static std::atomic<uint64_t> calls{0};
+  uint64_t n = calls.fetch_add(1);
+  if (n < 5 || n % 1000 == 999) {
+    XELOGI("XamNuiIsDeviceReady called (n={}, tid={:08X})", n + 1,
+           XThread::GetCurrentThread() ? XThread::GetCurrentThread()->thread_id() : 0);
+  }
   if (!cvars::allow_nui_initialization) return 0;
   return (kd() && kd()->is_initialized()) ? 1u : 0u;
 }
@@ -279,7 +313,16 @@ dword_result_t XamNuiHudSetEngagedTrackingID_entry(dword_t id) {
 DECLARE_XAM_EXPORT1(XamNuiHudSetEngagedTrackingID, kNone, kImplemented);
  
 qword_result_t XamNuiHudGetEngagedTrackingID_entry() {
-  return engaged_tracking_id;
+  static std::atomic<uint64_t> calls{0};
+  uint64_t n = calls.fetch_add(1);
+  if (n < 5 || n % 1000 == 999) {
+    XELOGI("XamNuiHudGetEngagedTrackingID called (n={}, tid={:08X})", n + 1,
+           XThread::GetCurrentThread() ? XThread::GetCurrentThread()->thread_id() : 0);
+  }
+  if (engaged_tracking_id != 0) {
+    return engaged_tracking_id;
+  }
+  return (kd() && kd()->is_initialized()) ? 1 : 0;
 }
 DECLARE_XAM_EXPORT1(XamNuiHudGetEngagedTrackingID, kNone, kImplemented);
  
@@ -320,11 +363,16 @@ DECLARE_XAM_EXPORT1(XamNuiHudGetVersions, kNone, kImplemented);
 uint64_t NUI_Session_Id = 0;
 
 qword_result_t XamNuiIdentityGetSessionId_entry() {
-  if (NUI_Session_Id == 0) {
-    // xboxkrnl::XeCryptRandom_entry(NUI_Session_Id, 8);
-    NUI_Session_Id = 0xDEADF00DDEADF00D;
+  static std::atomic<uint64_t> calls{0};
+  uint64_t n = calls.fetch_add(1);
+  if (n < 5 || n % 1000 == 999) {
+    XELOGI("XamNuiIdentityGetSessionId called (n={}, tid={:08X})", n + 1,
+           XThread::GetCurrentThread() ? XThread::GetCurrentThread()->thread_id() : 0);
   }
-  return NUI_Session_Id;
+  // Returning 0 (no active identity session) lets titles skip the identity
+  // handshake entirely. A fabricated session implies an identity engine that
+  // must service the frontend's async protocol, which we do not implement.
+  return 0;
 }
 DECLARE_XAM_EXPORT1(XamNuiIdentityGetSessionId, kNone, kImplemented);
 
@@ -375,19 +423,59 @@ dword_result_t XamXStudioRequest_entry(dword_t cmd, lpvoid_t p_in_out) {
   if (cmd == 6 && p_in_out) {
     auto* out = kernel_state()->memory()->TranslateVirtual<uint32_t*>(
         p_in_out.guest_address());
-    if (cvars::allow_nui_initialization) {
-      // Report Kinect as present (no error bits).
-      *out = 0;
-    } else {
-      // Report Kinect as NOT present (bit 31 set) so callers that check this
-      // before XamNuiGetDeviceStatus don't spin-wait.
-      *out = xe::byte_swap(uint32_t(0x80000000));
+    if (out) {
+      if (cvars::allow_nui_initialization) {
+        // Report Kinect as present (no error bits).
+        *out = 0;
+      } else {
+        // Report Kinect as NOT present (bit 31 set) so callers that check this
+        // before XamNuiGetDeviceStatus don't spin-wait.
+        *out = xe::byte_swap(uint32_t(0x80000000));
+      }
     }
     return X_ERROR_SUCCESS;
   }
-  return X_E_FAIL;
+
+  if (cmd == 0x1003 && p_in_out) {
+    // Camera status query from 0x82D203F8:
+    // Writes status / camera count to *(uint32_t*)(p_in_out + 4).
+    // Caller at 0x82D24074 checks:
+    //   cmplwi cr6, r11, 0 / beq -> error
+    //   bdz -> error if == 1
+    //   bdz -> error if == 2 (takes 0x82D240A4: r28=1, r30=1 -> ready!)
+    auto* out = kernel_state()->memory()->TranslateVirtual<uint32_t*>(
+        p_in_out.guest_address() + 4);
+    if (out) {
+      *out = xe::byte_swap(uint32_t(2));  // Camera ready, returns count=2
+    }
+    return X_ERROR_SUCCESS;
+  }
+
+  if (cmd == 0x1004 && p_in_out) {
+    // Camera stream query from 0x82D24424 / 0x82D24758:
+    // Checks flags at *(uint32_t*)(p_in_out + 4).
+    auto* out = kernel_state()->memory()->TranslateVirtual<uint32_t*>(
+        p_in_out.guest_address() + 4);
+    if (out) {
+      *out = xe::byte_swap(uint32_t(0x20));  // flag 0x20 -> r27 = 1
+    }
+    return X_ERROR_SUCCESS;
+  }
+
+  // Decompiled XamXStudioRequest commands called by Kinect driver:
+  // cmd == 1: Init handshake called from 0x82D22824. Expects >= 0 (S_OK).
+  // cmd == 0x301: Driver init called from 0x82D26C20.
+  // cmd == 0x302: Driver shutdown called from 0x82D2287C.
+  // cmd == 0x1003: Camera status query called from 0x82D203F8.
+  // cmd == 0x1004: Camera stream query called from 0x82D24424 / 0x82D24758.
+  // cmd == 0x1401: Stream open called from 0x82D273F8.
+  // cmd == 0x1402: Stream close called from 0x82D26EB0.
+  // cmd == 0x1502: Frame query called from 0x82D35720.
+  XELOGD("XamXStudioRequest: cmd=0x{:X}, p_in_out=0x{:08X}", cmd.value(),
+         p_in_out.guest_address());
+  return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT2(XamXStudioRequest, kNone, kStub, kHighFrequency);
+DECLARE_XAM_EXPORT2(XamXStudioRequest, kNone, kImplemented, kHighFrequency);
 
 // --- Camera Elevation & Motor Control ---
 dword_result_t XamNuiCameraRememberFloor_entry() { return X_ERROR_SUCCESS; }
@@ -577,16 +665,43 @@ DECLARE_XAM_EXPORT1(XamCacheReset, kNone, kStub);
 
 // --- Biometric data stubs ---
 dword_result_t XamReadBiometricData_entry(dword_t user_index, lpvoid_t buffer, dword_t buffer_size) {
-  XELOGI("XamReadBiometricData(user={}, size={}) stub", user_index.value(), buffer_size.value());
-  if (buffer && buffer_size) {
-    std::memset(kernel_memory()->TranslateVirtual(buffer.guest_address()), 0, buffer_size);
+  // This is reached via XAM message 0x2A008, which the game dispatches with
+  // arguments that are not yet validated. Guard hard: TranslateVirtual returns
+  // nullptr for unmapped guest addresses, and memset'ing a bogus size over that
+  // nullptr was crashing the host inside VCRUNTIME140.dll.
+  static uint32_t call_count = 0;
+  if (++call_count <= 16) {
+    XELOGI("XamReadBiometricData(user={}, buffer={:08X}, size={}) stub",
+           user_index.value(), buffer.guest_address(), buffer_size.value());
   }
+
+  if (!buffer || !buffer_size) {
+    return X_ERROR_SUCCESS;
+  }
+  // Reject absurd sizes before touching guest memory.
+  if (buffer_size > 0x10000) {
+    XELOGW("XamReadBiometricData: implausible size {}, ignoring", buffer_size.value());
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  auto* dst = kernel_memory()->TranslateVirtual(buffer.guest_address());
+  if (!dst) {
+    XELOGW("XamReadBiometricData: unmapped buffer {:08X}",
+           buffer.guest_address());
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  std::memset(dst, 0, buffer_size);
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamReadBiometricData, kNone, kStub);
 
 dword_result_t XamWriteBiometricData_entry(dword_t user_index, lpvoid_t buffer, dword_t buffer_size) {
-  XELOGI("XamWriteBiometricData(user={}, size={}) stub", user_index.value(), buffer_size.value());
+  static uint32_t call_count = 0;
+  if (++call_count <= 16) {
+    XELOGI("XamWriteBiometricData(user={}, buffer={:08X}, size={}) stub",
+           user_index.value(), buffer.guest_address(), buffer_size.value());
+  }
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamWriteBiometricData, kNone, kStub);

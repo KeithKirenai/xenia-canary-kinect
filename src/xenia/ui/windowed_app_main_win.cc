@@ -90,6 +90,7 @@ struct HostExceptionReport {
   }
 
   void DisplayExceptionMessage() {
+    XELOGE("CRITICAL: Unhandled Exception in Xenia:\n{}", Report_Scratchbuffer);
     MessageBoxA(nullptr, Report_Scratchbuffer, "Unhandled Exception in Xenia",
                 MB_ICONERROR);
   }
@@ -204,14 +205,45 @@ static bool exception_pointers_handler(HostExceptionReport* report) {
     }
   }
 
+  std::string av_detail;
+  if (except_code == EXCEPTION_ACCESS_VIOLATION &&
+      report->ExceptionInfo->ExceptionRecord->NumberParameters >= 2) {
+    ULONG_PTR access_type =
+        report->ExceptionInfo->ExceptionRecord->ExceptionInformation[0];
+    ULONG_PTR fault_addr =
+        report->ExceptionInfo->ExceptionRecord->ExceptionInformation[1];
+    av_detail = fmt::format(
+        "Access Violation: {} address {:016X}\n",
+        access_type == 0   ? "read from"
+        : access_type == 1 ? "write to"
+                           : "execute at",
+        fault_addr);
+  }
+
+  std::string guest_detail;
+  if (xe::kernel::kernel_state()) {
+    auto current_xthread = xe::kernel::XThread::GetCurrentThread();
+    if (current_xthread && current_xthread->thread_state() &&
+        current_xthread->thread_state()->context()) {
+      auto* ctx = current_xthread->thread_state()->context();
+      guest_detail = fmt::format(
+          "Guest Context (TID {:08X}):\n  LR={:016X} CTR={:016X} MSR={:016X}\n"
+          "  r1(SP)={:016X} r3={:016X} r4={:016X} r5={:016X}\n"
+          "  r11={:016X} r12={:016X} r31={:016X}\n",
+          current_xthread->thread_id(), ctx->lr, ctx->ctr, ctx->msr, ctx->r[1],
+          ctx->r[3], ctx->r[4], ctx->r[5], ctx->r[11], ctx->r[12], ctx->r[31]);
+    }
+  }
+
   const std::string except_message = fmt::format(
       "Exception encountered!\nTitle Info: {}\nBuild: {}\nException address: "
-      "{}\nStackpointer: {}\nInstruction pointer: {}\nExceptionCode: 0x{} "
-      "({})\n",
+      "{}\nStackpointer: {}\nInstruction pointer: {}\nExceptionCode: 0x{:08X} "
+      "({})\n{}{}",
       title_info, build.c_str(), report->GetFormattedAddress(exception_addr),
       report->GetFormattedAddress(last_stackpointer),
       report->GetFormattedAddress(last_rip), except_code,
-      HostExceptionReport::ChompNewlines(Ntstatus_msg(except_code)));
+      HostExceptionReport::ChompNewlines(Ntstatus_msg(except_code)),
+      av_detail, guest_detail);
 
   report->AddString(except_message.c_str());
 

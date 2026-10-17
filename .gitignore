@@ -116,3 +116,45 @@ node_modules/.bin/
 /cache0
 /devkit
 recent.toml
+
+# ==============================================================================
+# Kinect development local artifacts (never commit)
+# ==============================================================================
+
+# Guest memory dumps produced by the NUI diagnostics in xboxkrnl_debug.cc.
+guest_nuitest_dump.bin
+guest_code_dump.bin
+
+# Screenshots captured from the emulator window during testing.
+sst.png
+sst2.png
+nuiview_debug.png
+test_img.png
+test_snapshots/
+
+# Runtime logs / config scratch files from manual test runs.
+per_second_ocr_log.txt
+curr_config.txt
+run3_config.txt
+
+# The compiled Kinect smoke-test title (build output, not source).
+SimpleSkeletonTracking/
+
+# Guest memory snapshots from the NUI diagnostics. These are multi-tens-of-MB
+# dumps of live guest RAM (image + heap) used only for offline reverse
+# engineering; they are regenerated on demand and must never be committed.
+guest_nui_dump.bin
+guest_probe_a.bin
+guest_probe_b.bin
+guest_xam_desc.bin
+guest_xam_msg.bin
+guest_heap_low.bin
+guest_heap_high.bin
+nui_slice.bin
+guest_code_dump.bin
+
+# Output of tools/thunks.py (regenerated from any run's xenia.log).
+thunks.txt
+
+# Vendored third-party RE tooling, unrelated to Xenia. Not part of this project.
+.rea_tool/

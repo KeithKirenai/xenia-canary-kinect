@@ -205,10 +205,15 @@ dword_result_t ObOpenObjectByName_entry(lpunknown_t obj_attributes_ptr,
 }
 DECLARE_XBOXKRNL_EXPORT1(ObOpenObjectByName, kNone, kImplemented);
 // chrispy: investigate this, pretty certain it does not properly emulate the
-// original
 dword_result_t ObOpenObjectByPointer_entry(lpvoid_t object_ptr,
                                            lpdword_t out_handle_ptr) {
+  if (!out_handle_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   *out_handle_ptr = 0;
+  if (!object_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   auto object = XObject::GetNativeObject<XObject>(kernel_state(), object_ptr);
   if (!object) {
     return X_STATUS_UNSUCCESSFUL;

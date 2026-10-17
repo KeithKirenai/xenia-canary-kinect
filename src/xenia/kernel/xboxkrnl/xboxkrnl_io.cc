@@ -8,6 +8,9 @@
  */
 
 #include "xenia/base/logging.h"
+
+#include <atomic>
+
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -68,6 +71,16 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
     return X_STATUS_OBJECT_NAME_INVALID;
   }
 
+  {
+    // Diagnostic: titles probe many paths at startup; log the outcome so a
+    // failed resource lookup (e.g. the NUI identity database) is visible.
+    static std::atomic<uint64_t> io_probe_count{0};
+    uint64_t n = io_probe_count.fetch_add(1);
+    if (n < 200) {
+      XELOGI("NtCreateFile probe #{}: '{}'", n + 1, target_path);
+    }
+  }
+
   if (object_attrs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
       object_attrs->root_directory != 0) {
     auto root_file = kernel_state()->object_table()->LookupObject<XFile>(
@@ -87,6 +100,14 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
       (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
       (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file,
       &file_action);
+  {
+    static std::atomic<uint64_t> io_result_count{0};
+    uint64_t n = io_result_count.fetch_add(1);
+    if (n < 200) {
+      XELOGI("NtCreateFile open #{}: '{}' -> {:08X}", n + 1, target_path,
+             static_cast<uint32_t>(result));
+    }
+  }
   object_ref<XFile> file = nullptr;
 
   X_HANDLE handle = X_INVALID_HANDLE_VALUE;

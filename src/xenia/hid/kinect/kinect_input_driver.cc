@@ -17,7 +17,12 @@
 
 #include "xenia/base/logging.h"
 #include "xenia/base/threading.h"
+#include "xenia/kernel/diagnostics_dump.h"
+#include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xevent.h"
+#include "xenia/kernel/xsemaphore.h"
+#include "xenia/kernel/xtimer.h"
 
 // Platform-specific dynamic loading.
 #if XE_PLATFORM_WIN32
@@ -37,6 +42,43 @@
 DEFINE_string(kinect_backend, "any",
               "Kinect skeleton tracking backend. Options: [any, synthetic, kinect_v1, mediapipe]",
               "HID");
+DEFINE_bool(kinect_force_sync_objects, false,
+            "Signal guest events/semaphores/timers the NUI workers wait on. "
+            "UNSOUND: those objects belong to guest synchronisation and waking "
+            "a thread without its work item can corrupt its scheduling. Off by "
+            "default; only the registered skeleton frame event is signalled.",
+            "HID");
+// Diagnostic: instead of writing real skeleton data into the guest's shared
+// frame buffer, write a sentinel at every dword that encodes its own offset
+// (0x5A000000 | offset). A guest memory dump taken afterwards then shows every
+// place the title copied out of our buffer, which is the only reliable way to
+// confirm the frame layout it expects at that address.
+DEFINE_bool(nui_nui_layout_probe, false,
+            "Write self-describing sentinels into the shared skeleton frame "
+            "buffer and dump guest memory so the offsets the title reads can be "
+            "recovered. Diagnostic only; the title cannot parse sentinels.",
+            "HID");
+// Diagnostic: fill the shared frame buffer with sentinels once, then strip all
+// access from its page. If the title ever loads from that address the guest
+// takes a page fault, which proves whether it reads the buffer at all -- the
+// sentinels alone cannot show this, because a title that reads fields and
+// discards them leaves no trace in a memory dump.
+DEFINE_bool(nui_nui_guard_page, false,
+            "After writing to the shared skeleton frame buffer, remove all "
+            "access from its page to detect whether the title ever reads it. "
+            "Diagnostic only; a fault means the title does read it.",
+            "HID");
+// Diagnostic: dump the guest *heap* some seconds after the NUI runtime is up.
+// The title's NUI pipeline is push-driven: a producer posts 32-bit work items
+// into a 4-entry ring in the worker object and then signals its event. The
+// enqueue routine (guest 0x82C48EB0) has no direct branch-link callers and its
+// address appears nowhere in the 0x82000000-0x83FFFFFF image, so the pointer to
+// it must be published at runtime on the heap -- which is why the static image
+// dump taken at XamNuiGetDeviceStatus can never show it. This dumps the heap.
+DEFINE_int32(nui_heap_dump_after_s, 0,
+             "If > 0, dump guest heap snapshots this many seconds after the "
+             "driver poll thread starts. 0 disables (default).",
+             "HID");
 
 namespace xe {
 namespace hid {
@@ -324,6 +366,50 @@ void KinectInputDriver::SetSkeletonFrameEvent(xe::kernel::XEvent* event) {
          static_cast<void*>(event));
 }
 
+void KinectInputDriver::AddSyncEvent(xe::kernel::XEvent* event) {
+  if (!event) return;
+  std::lock_guard<std::mutex> lock(sync_events_mutex_);
+  for (auto* ev : sync_events_) {
+    if (ev == event) return;
+  }
+  sync_events_.push_back(event);
+  XELOGI("KinectInputDriver: AddSyncEvent event={:p} (total: {})",
+         static_cast<void*>(event), sync_events_.size());
+}
+
+void KinectInputDriver::AddNuiWakeEvent(xe::kernel::XEvent* event) {
+  if (!event) return;
+  std::lock_guard<std::mutex> lock(sync_events_mutex_);
+  for (auto* ev : nui_wake_events_) {
+    if (ev == event) return;
+  }
+  nui_wake_events_.push_back(event);
+  XELOGI("KinectInputDriver: AddNuiWakeEvent event={:p} handle={:08X} (total: {})",
+         static_cast<void*>(event), event->handle(), nui_wake_events_.size());
+}
+
+void KinectInputDriver::AddSyncSemaphore(xe::kernel::XSemaphore* sem) {
+  if (!sem) return;
+  std::lock_guard<std::mutex> lock(sync_events_mutex_);
+  for (auto* s : sync_semaphores_) {
+    if (s == sem) return;
+  }
+  sync_semaphores_.push_back(sem);
+  XELOGI("KinectInputDriver: AddSyncSemaphore semaphore={:p} (total: {})",
+         static_cast<void*>(sem), sync_semaphores_.size());
+}
+
+void KinectInputDriver::AddSyncTimer(xe::kernel::XTimer* timer) {
+  if (!timer) return;
+  std::lock_guard<std::mutex> lock(sync_events_mutex_);
+  for (auto* t : sync_timers_) {
+    if (t == timer) return;
+  }
+  sync_timers_.push_back(timer);
+  XELOGI("KinectInputDriver: AddSyncTimer timer={:p} (total: {})",
+         static_cast<void*>(timer), sync_timers_.size());
+}
+
 X_RESULT KinectInputDriver::NuiSkeletonGetNextFrame(
     uint32_t wait_ms, X_NUI_SKELETON_FRAME* out_frame) {
   if (!initialized_) return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -334,8 +420,12 @@ X_RESULT KinectInputDriver::NuiSkeletonGetNextFrame(
     {
       std::lock_guard<std::mutex> lock(frame_mutex_);
       if (new_frame_) {
+        // Note: the latest frame is *not* consumed here. This is a polling
+        // API (several consumers -- the COM trampoline, XamApp diagnostics --
+        // and the game's own render loop read the same sensor), and a
+        // single-consumer "new frame" flag made whoever lost the race see a
+        // zeroed frame instead of the current one.
         std::memcpy(out_frame, &frame_latest_, sizeof(*out_frame));
-        new_frame_ = false;
         return X_ERROR_SUCCESS;
       }
     }
@@ -503,8 +593,54 @@ void KinectInputDriver::PollThread() {
   xe::threading::set_name("KinectPoll");
   constexpr auto kPeriod = std::chrono::milliseconds(1000 / 30);
 
+  // Force-signalling guest events/semaphores/timers that the guest never asked
+  // us to signal is unsound. Off by default; only the registered skeleton frame
+  // event is signalled.
+  const bool force_sync_objects = cvars::kinect_force_sync_objects;
+
+  // Diagnostic: count produced frames and how often we actually signal the
+  // guest. A title that waits on a skeleton frame event will hang forever if
+  // this counter stops advancing.
+  uint64_t frames_produced = 0;
+  uint64_t guest_signals = 0;
+  auto last_report = std::chrono::steady_clock::now();
+
+  // One-shot guest heap snapshots, taken once the title's NUI runtime has had
+  // time to allocate its worker object and publish the push callback. The
+  // producer callback (guest 0x82C48EB0) is not referenced anywhere in the
+  // title image, so it can only be found on the heap after startup.
+  const int32_t heap_dump_after_s = cvars::nui_heap_dump_after_s;
+  auto poll_started = std::chrono::steady_clock::now();
+  bool heap_dumped = false;
+
   while (thread_running_) {
     auto t0 = std::chrono::steady_clock::now();
+
+    if (heap_dump_after_s > 0 && !heap_dumped) {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+          t0 - poll_started).count();
+      if (elapsed >= heap_dump_after_s) {
+        heap_dumped = true;
+        XELOGI("KinectInputDriver: heap dump at t+{}s", elapsed);
+        // Ask the memory manager where the guest's heaps actually live rather
+        // than guessing a window: the first attempt scanned 0x80000000-0x82000000
+        // and 0x84000000-0x86000000 and found nothing.
+        auto* kss = xe::kernel::kernel_state();
+        if (kss) {
+          xe::Memory* guest_mem = kss->memory();
+          if (guest_mem) {
+            guest_mem->DumpMap();
+          }
+        }
+        // DumpMap() shows the guest heap is 0x00000000-0x3FFFFFFF (1 GB at zero),
+        // but the NUI worker's thread parameter landed at 0x4004E998, just above
+        // it. Snapshot both windows.
+        ::xe::kernel::DumpGuestImageForDiagnostics("guest_heap_low.bin",
+                                                   0x00000000u, 0x2000000u);
+        ::xe::kernel::DumpGuestImageForDiagnostics("guest_heap_high.bin",
+                                                   0x40000000u, 0x1000000u);
+      }
+    }
 
     switch (backend_) {
       case Backend::WindowsSDK:
@@ -527,8 +663,187 @@ void KinectInputDriver::PollThread() {
     }
 
     // Signal the game's skeleton frame event if registered.
-    if (new_frame_ && skeleton_xevent_) {
-      skeleton_xevent_->Set(0, false);
+    if (new_frame_) {
+      auto write_to_guest_dst = [&](uint8_t* dst) {
+        if (!dst) return;
+        uint64_t ts = static_cast<uint64_t>(frame_latest_.liTimeStamp);
+        xe::store_and_swap<uint64_t>(reinterpret_cast<uint64_t*>(dst + 0), ts);
+        xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(dst + 8), frame_latest_.dwFrameNumber);
+        xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(dst + 12), frame_latest_.dwFlags);
+
+        auto write_float = [](uint8_t* d, float v) {
+          uint32_t bits;
+          std::memcpy(&bits, &v, sizeof(float));
+          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(d), bits);
+        };
+        write_float(dst + 16, frame_latest_.vFloorClipPlane.x);
+        write_float(dst + 20, frame_latest_.vFloorClipPlane.y);
+        write_float(dst + 24, frame_latest_.vFloorClipPlane.z);
+        write_float(dst + 28, frame_latest_.vFloorClipPlane.w);
+
+        write_float(dst + 32, frame_latest_.vNormalToGravity.x);
+        write_float(dst + 36, frame_latest_.vNormalToGravity.y);
+        write_float(dst + 40, frame_latest_.vNormalToGravity.z);
+        write_float(dst + 44, frame_latest_.vNormalToGravity.w);
+
+        constexpr uint32_t kSkelDataSize = 436;
+        constexpr uint32_t kSkelDataOffset = 48;
+        if (cvars::nui_nui_layout_probe || cvars::nui_nui_guard_page) {
+          for (uint32_t o = 0; o < 0x800; ++o) {
+            xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(dst + o * 4),
+                                          0x5A000000u | o);
+          }
+          return;
+        }
+        constexpr uint32_t kMaxSkeletonsForGuestFrame = 4;
+        for (uint32_t s = 0; s < kMaxSkeletonsForGuestFrame; ++s) {
+          const auto& src = frame_latest_.SkeletonData[s];
+          uint8_t* sd = dst + kSkelDataOffset + s * kSkelDataSize;
+
+          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 0), static_cast<uint32_t>(src.eTrackingState));
+          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 4), src.dwTrackingID);
+          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 8), src.dwEnrollmentIndex);
+          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 12), src.dwUserIndex);
+
+          write_float(sd + 16, src.Position.x);
+          write_float(sd + 20, src.Position.y);
+          write_float(sd + 24, src.Position.z);
+          write_float(sd + 28, src.Position.w);
+
+          for (uint32_t j = 0; j < kNuiSkeletonPositionCount; ++j) {
+            uint8_t* jp = sd + 32 + j * 16;
+            write_float(jp + 0, src.SkeletonPositions[j].x);
+            write_float(jp + 4, src.SkeletonPositions[j].y);
+            write_float(jp + 8, src.SkeletonPositions[j].z);
+            write_float(jp + 12, src.SkeletonPositions[j].w);
+          }
+
+          for (uint32_t j = 0; j < kNuiSkeletonPositionCount; ++j) {
+            xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 352 + j * 4), static_cast<uint32_t>(src.eSkeletonPositionTrackingState[j]));
+          }
+
+          xe::store_and_swap<uint32_t>(reinterpret_cast<uint32_t*>(sd + 432), src.dwQualityFlags);
+        }
+      };
+
+      uint8_t* dst1 = shared_guest_dst_.load();
+      if (dst1) {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        xe::memory::PageAccess old_prot;
+        const bool protected_ok = xe::memory::Protect(
+            dst1, 0x1000, xe::memory::PageAccess::kReadWrite, &old_prot);
+        write_to_guest_dst(dst1);
+        if (protected_ok) {
+          xe::memory::Protect(dst1, 0x1000, old_prot, nullptr);
+        }
+        if (cvars::nui_nui_guard_page) {
+          static std::atomic<bool> guarded{false};
+          if (!guarded.exchange(true)) {
+            const bool ok = xe::memory::Protect(
+                dst1, 0x1000, xe::memory::PageAccess::kNoAccess, nullptr);
+            XELOGI(
+                "KinectInputDriver: guard page installed on shared frame "
+                "buffer host_ptr={:p} -> {}",
+                static_cast<void*>(dst1), ok);
+          }
+        }
+      }
+
+      if (skeleton_xevent_) {
+        skeleton_xevent_->Set(0, false);
+        ++guest_signals;
+      }
+
+      // REMOVED: the fabricated "title internal NUI device circular queue"
+      // write. It targeted a hardcoded guest address (0x83896510) with an
+      // invented layout -- offsets +0x00, +0x58, +0xA40 and a queue slot at
+      // +0xA70 -- none of which were ever observed in the guest. Three
+      // reasons it could not work and one reason it was actively harmful:
+      //   1. The whole region reads back as zero in a runtime dump.
+      //   2. The title is never handed a pointer to it, so it cannot read it.
+      //   3. Skeleton frames only reach a title that negotiated a buffer.
+      //   4. Writing 0x4000 bytes of guessed structure into live guest memory
+      //      every 33 ms is precisely the corruption that froze the title on
+      //      2026-10-13. Do not reintroduce a write target derived from an
+      //      address heuristic; deliver frames through a contract the title
+      //      established itself.
+      //
+      // write_to_guest_dst() above still serves the registered shared frame
+      // buffer, which the title did hand us.
+
+      if (cvars::nui_nui_layout_probe) {
+        // After the sentinel has been sitting in the buffer long enough for the
+        // title to consume it, snapshot guest memory so we can search for the
+        // sentinel values and learn which offsets the title actually reads.
+        // Two snapshots: the first catches the title mid-consumption (it may
+        // fault on a sentinel tracking state and die before the second), the
+        // second catches anything it keeps in long-lived state.
+        static std::atomic<uint64_t> probe_frames{0};
+        const uint64_t probe_n = probe_frames.fetch_add(1);
+        if (probe_n == 3) {
+          ::xe::kernel::DumpGuestImageForDiagnostics("guest_probe_a.bin",
+                                                    0x82000000u, 0x2000000u);
+        } else if (probe_n == 60) {
+          ::xe::kernel::DumpGuestImageForDiagnostics("guest_probe_b.bin",
+                                                    0x82000000u, 0x2000000u);
+        }
+      }
+
+      // Wake the title's own NUI queue. Titles using the XAM NUI service park
+      // their worker threads on an event they create themselves *after* the
+      // 0x2B001 bind, so there is no handle to register up front. Those objects
+      // are auto-reset (KeResetEvent right after the wait in the title's NUI
+      // worker) and carry work items that only appear once the game enqueues
+      // them, so waking them every frame is safe: an empty queue just returns
+      // immediately, and the title drives the actual data through the shared
+      // frame buffer instead.
+      for (auto* ev : nui_wake_events_) {
+        if (ev) {
+          ev->Set(0, false);
+        }
+      }
+
+      // Force-signalling arbitrary guest events/semaphores/timers every frame
+      // is unsound: those objects belong to the guest's own synchronisation and
+      // signalling them behind its back can corrupt its scheduling (a thread
+      // may wake, find its work item missing, and re-wait). Only the skeleton
+      // frame event above -- which the guest explicitly registered with us via
+      // SetSkeletonFrameEvent -- is legitimate. The rest stays opt-in.
+      if (force_sync_objects) {
+        std::lock_guard<std::mutex> lock(sync_events_mutex_);
+        for (auto* ev : sync_events_) {
+          if (ev) {
+            ev->Set(0, false);
+          }
+        }
+        for (auto* sem : sync_semaphores_) {
+          if (sem) {
+            std::ignore = sem->ReleaseSemaphore(1, nullptr);
+          }
+        }
+        for (auto* tim : sync_timers_) {
+          if (tim) {
+            std::ignore = tim->SetTimer(0, 0, 0, 0, false);
+          }
+        }
+      }
+    }
+    ++frames_produced;
+
+    // Report every 5s so a stalled producer is obvious in the log.
+    auto now = std::chrono::steady_clock::now();
+    if (now - last_report > std::chrono::seconds(5)) {
+      last_report = now;
+      XELOGI(
+          "KinectInputDriver: frames={} guest_signals={} dst1={:08X} dst2={:08X} "
+          "skel_event={} tracked_state={}",
+          frames_produced, guest_signals,
+          static_cast<uint32_t>(
+              reinterpret_cast<uintptr_t>(shared_guest_dst_.load())),
+          static_cast<uint32_t>(
+              reinterpret_cast<uintptr_t>(shared_guest_dst2_.load())),
+          skeleton_xevent_ ? 1 : 0,
+          static_cast<int>(frame_latest_.SkeletonData[0].eTrackingState));
     }
 
     auto elapsed = std::chrono::steady_clock::now() - t0;
@@ -618,6 +933,7 @@ void KinectInputDriver::PollWindowsSDK() {
   std::memcpy(&frame_latest_.vFloorClipPlane, raw + 16, 16);
   std::memcpy(&frame_latest_.vNormalToGravity, raw + 32, 16);
 
+  bool has_physical_tracked = false;
   for (uint32_t s = 0; s < kNuiSkeletonCount; ++s) {
     const uint8_t* src = raw + kWinSkelOffset + s * kWinSkelSize;
     auto& dst = frame_latest_.SkeletonData[s];
@@ -630,7 +946,16 @@ void KinectInputDriver::PollWindowsSDK() {
     for (uint32_t j = 0; j < kNuiSkeletonPositionCount; ++j)
       std::memcpy(&dst.eSkeletonPositionTrackingState[j], src + 352 + j * 4, 4);
     std::memcpy(&dst.dwQualityFlags, src + 432, 4);
+    if (dst.eTrackingState == X_NUI_SKELETON_TRACKED) {
+      has_physical_tracked = true;
+    }
   }
+
+  // If physical hardware does not see a standing person right now, seamlessly fall back to synthetic:
+  if (!has_physical_tracked) {
+    BuildSyntheticFrame(&frame_latest_);
+  }
+
   new_frame_ = true;
 #endif
 }

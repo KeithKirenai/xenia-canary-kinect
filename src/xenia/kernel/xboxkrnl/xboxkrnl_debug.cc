@@ -7,9 +7,11 @@
  ******************************************************************************
  */
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/debugging.h"
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
+#include "xenia/kernel/diagnostics_dump.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -19,11 +21,107 @@
 #include "xenia/ui/window.h"
 #include "xenia/ui/windowed_app_context.h"
 
+DEFINE_bool(dbg_break_on_guest_breakpoint, false,
+            "Break into the host debugger when the guest calls DbgBreakPoint. "
+            "Off by default: with no kernel debugger attached, retail "
+            "consoles ignore it and continue.",
+            "Kernel");
+
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
 
-void DbgBreakPoint_entry() { xe::debugging::Break(); }
+// One-shot dump of the title's image so offline disassembly works on
+// compressed XEXs, which Xenia decompresses in guest RAM. Isolated in a
+// no-unwind function because it uses SEH to survive unmapped pages
+// (TranslateVirtual hands back a bad host pointer for those).
+static void __declspec(noinline) DumpGuestImageNoUnwind(uint32_t code_base,
+                                                        uint32_t code_size,
+                                                        const char* filename) {
+  auto* mem = kernel_state()->memory();
+  FILE* f = fopen(filename, "wb");
+  if (!f) {
+    return;
+  }
+  uint8_t* buf = (uint8_t*)_alloca(0x1000);
+  uint32_t pages_written = 0;
+  for (uint32_t off = 0; off < code_size; off += 0x1000) {
+    auto* p = mem->TranslateVirtual<uint8_t*>(code_base + off);
+    memset(buf, 0, 0x1000);
+    if (p) {
+      __try {
+        memcpy(buf, p, 0x1000);
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+      }
+    }
+    fwrite(buf, 1, 0x1000, f);
+    ++pages_written;
+  }
+  fflush(f);
+  fclose(f);
+  XELOGI("Guest image dump: {} pages ({} bytes) written to {}", pages_written,
+         code_size, filename);
+}
+
+}  // namespace xboxkrnl
+}  // namespace kernel
+}  // namespace xe
+
+namespace xe {
+namespace kernel {
+
+// Exposed for other kernel/xam call sites that need a snapshot of the title's
+// decompressed image (e.g. the NUI service handshake in xam_nui.cc).
+void DumpGuestImageForDiagnostics(const char* filename, uint32_t base,
+                                  uint32_t size) {
+  xboxkrnl::DumpGuestImageNoUnwind(base, size, filename);
+}
+
+using ::xe::kernel::DumpGuestImageForDiagnostics;
+
+}  // namespace kernel
+}  // namespace xe
+
+namespace xe {
+namespace kernel {
+namespace xboxkrnl {
+
+using ::xe::kernel::DumpGuestImageForDiagnostics;
+
+static bool dumped_code = false;
+
+void DbgBreakPoint_entry() {
+  if (cvars::dbg_break_on_guest_breakpoint) {
+    xe::debugging::Break();
+    return;
+  }
+  // No kernel debugger attached: log and continue, like retail hardware.
+  auto thread = XThread::GetCurrentThread();
+  uint32_t lr = 0;
+  if (thread && thread->thread_state() && thread->thread_state()->context()) {
+    lr = static_cast<uint32_t>(thread->thread_state()->context()->lr);
+  }
+  XELOGI("DbgBreakPoint: guest break ignored (tid={:08X} lr={:08X})",
+         thread ? thread->thread_id() : 0, lr);
+  if (lr) {
+    auto* code = kernel_state()->memory()->TranslateVirtual<uint8_t*>(lr - 0x1C);
+    if (code) {
+      std::string words;
+      for (int i = 0; i < 16; ++i) {
+        words += fmt::format("{:08X} ", xe::load_and_swap<uint32_t>(code + i * 4));
+      }
+      XELOGI("DbgBreakPoint code @{:010X}: {}", lr - 0x1C, words);
+    }
+    auto* errstr = kernel_state()->memory()->TranslateVirtual<const char*>(0x8207FF44);
+    if (errstr) {
+      XELOGI("DbgBreakPoint error string @0x8207FF44: '{}'", errstr);
+    }
+  }
+  if (!dumped_code) {
+    dumped_code = true;
+    DumpGuestImageNoUnwind(0x82000000, 0x400000, "guest_nuitest_dump.bin");
+  }
+}
 DECLARE_XBOXKRNL_EXPORT2(DbgBreakPoint, kDebug, kStub, kImportant);
 
 // https://msdn.microsoft.com/en-us/library/xcb2z8hs.aspx
@@ -189,6 +287,12 @@ DECLARE_XBOXKRNL_EXPORT2(KeBugCheckEx, kDebug, kStub, kImportant);
 
 void KeBugCheck_entry(dword_t code) { KeBugCheckEx_entry(code, 0, 0, 0, 0); }
 DECLARE_XBOXKRNL_EXPORT2(KeBugCheck, kDebug, kImplemented, kImportant);
+
+dword_result_t EtxProducerRegister_entry(lpvoid_t p1, lpvoid_t p2, lpvoid_t p3,
+                                          dword_t p4, lpvoid_t p5, lpvoid_t p6) {
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(EtxProducerRegister, kDebug, kStub);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

@@ -15,6 +15,7 @@
 #include "xenia/kernel/smc.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/content_manager.h"
 #include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_private.h"
@@ -24,6 +25,7 @@
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/vfs/devices/stfs_xbox.h"
+#include "xenia/vfs/virtual_file_system.h"
 #include "xenia/xbox.h"
 
 DEFINE_int32(
@@ -488,10 +490,53 @@ dword_result_t XamContentOpenFile_entry(
     dword_t user_index, lpstring_t root_name, lpstring_t path, dword_t flags,
     lpdword_t disposition_ptr, lpdword_t license_mask_ptr,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
-  // TODO(gibbed): arguments assumed based on XamContentCreate.
-  return X_ERROR_FILE_NOT_FOUND;
+  if (!root_name || *root_name == '\0') {
+    return X_ERROR_INVALID_NAME;
+  }
+  if (!path || *path == '\0') {
+    return X_ERROR_INVALID_NAME;
+  }
+
+  // Resolve the guest-supplied path against the mounted devices. Games use this
+  // to pull bundled assets (e.g. \SpringfieldGame\CookedXenon for Kinect
+  // Adventures) out of the disc image; failing here leaves the game stuck on
+  // its splash screen because its asset-loading worker threads all die.
+  auto entry = kernel_state()->file_system()->ResolvePath(path.value());
+  if (!entry) {
+    XELOGI("XamContentOpenFile: path '{}' not found", path.value());
+    return X_ERROR_FILE_NOT_FOUND;
+  }
+
+  const std::filesystem::path host_path =
+      kernel_state()->emulator()->content_root() / entry->name();
+
+  // Pull the file off the disc the first time it is requested.
+  if (!std::filesystem::exists(host_path)) {
+    uint64_t progress = 0;
+    vfs::VirtualFileSystem::ExtractDeviceFile(
+        entry, kernel_state()->emulator()->content_root(), progress, true);
+  }
+
+  // Mount (or reuse the already-mounted) package under the caller's root name
+  // so the content shows up as e.g. "d1:\".
+  auto* package = kernel_state()->content_manager()->OpenAndMountPackage(
+      host_path, root_name.value());
+  if (!package) {
+    XELOGI("XamContentOpenFile: failed to mount '{}' as '{}'", host_path,
+           root_name.value());
+    return X_ERROR_FILE_NOT_FOUND;
+  }
+
+  XELOGI("XamContentOpenFile: mounted '{}' as root '{}'", path.value(),
+         root_name.value());
+
+  if (disposition_ptr) {
+    *disposition_ptr = static_cast<uint32_t>(kDispositionState::Open);
+  }
+
+  return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kStub);
+DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kImplemented);
 
 dword_result_t XamContentFlush_entry(lpstring_t root_name,
                                      pointer_t<XAM_OVERLAPPED> overlapped_ptr) {

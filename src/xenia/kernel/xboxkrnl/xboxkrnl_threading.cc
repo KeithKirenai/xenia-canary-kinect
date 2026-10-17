@@ -10,6 +10,8 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 #include "xenia/base/atomic.h"
 #include "xenia/base/clock.h"
+#include <algorithm>
+#include <vector>
 #include "xenia/base/platform.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/hid/kinect/kinect_input_driver.h"
@@ -19,6 +21,22 @@
 #include "xenia/kernel/xsemaphore.h"
 #include "xenia/kernel/xtimer.h"
 #include "xenia/xbox.h"
+
+// Diagnostic: log every distinct kernel object the title waits on once the
+// NUI device has been bound. Reveals what the title's frame-consumer thread is
+// actually blocked on.
+DEFINE_bool(nui_log_wait_objects, false,
+            "Log each distinct kernel object waited on after the NUI bind, with "
+            "its type and wait parameters. Diagnostic only.",
+            "Kinect");
+
+// Wake every event the title waits on with NUI-style wait parameters, not just
+// the first one. Titles park the worker queue *and* the frame-consumer thread
+// on separate events; waking only the first leaves the consumer blocked.
+DEFINE_bool(nui_wake_all_nui_events, true,
+            "Signal every event waited on with wait_reason 3 / processor_mode 1 "
+            "once per produced frame, instead of only the first one captured.",
+            "Kinect");
 
 namespace xe {
 namespace kernel {
@@ -430,6 +448,19 @@ void xeKeSetCurrentProcessType(uint32_t type, cpu::ppc::PPCContext* context) {
   auto pcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
   if (pcr->prcb_data.dpc_active) {
     pcr->processtype_value_in_dpc = type;
+    return;
+  }
+  // Outside a DPC the value belongs to the thread: KeGetCurrentProcessType
+  // reads it back from the current thread's process. Upstream Xenia dropped
+  // this on the floor, which broke titles that switch themselves into another
+  // process type at startup -- notably Kinect NUI titles, which call
+  // KeSetCurrentProcessType(X_PROCTYPE_NUI) before NuiInitialize and get
+  // E_NUI_DATABASE_NOT_FOUND back when the type never changes.
+  auto* kthread =
+      context->TranslateVirtual(pcr->prcb_data.current_thread);
+  if (kthread) {
+    reinterpret_cast<std::atomic_uint8_t*>(&kthread->process_type)
+        ->exchange(static_cast<uint8_t>(type));
   }
 }
 
@@ -995,9 +1026,60 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason,
     return X_STATUS_ABANDONED_WAIT_0;
   }
 
+  // Capture the NUI worker queue event. Titles using the XAM NUI service park
+  // their workers with this exact shape (relative timeout, reason 3, mode 1,
+  // from a call site inside the title's own NUI runtime) on an event they create
+  // after the 0x2B001 bind, so there is no message where it could be registered.
+  // Those objects are auto-reset (the title's NUI worker calls KeResetEvent right
+  // after the wait) and only hold guest work items, so waking them when a frame
+  // is produced is safe: with an empty queue the worker just returns.
+  if (auto* kd = xe::hid::kinect::KinectInputDriver::instance()) {
+    static bool registered_nui_waits = false;
+    if (!registered_nui_waits && wait_reason == 3 && processor_mode == 1 &&
+        object->type() == XObject::Type::Event) {
+      registered_nui_waits = true;
+      kd->AddNuiWakeEvent(static_cast<XEvent*>(object.get()));
+    }
+    // The title parks several threads on NUI-style events (wait_reason 3 /
+    // processor_mode 1): the worker queue plus, most likely, the thread that
+    // consumes skeleton frames. Capturing only the first left the consumer
+    // parked forever, which is exactly why the title never saw a player.
+    if (cvars::nui_wake_all_nui_events && wait_reason == 3 &&
+        processor_mode == 1 && object->type() == XObject::Type::Event) {
+      static std::vector<XEvent*> captured;
+      auto* ev = static_cast<XEvent*>(object.get());
+      if (std::find(captured.begin(), captured.end(), ev) == captured.end() &&
+          captured.size() < 8) {
+        captured.push_back(ev);
+        kd->AddNuiWakeEvent(ev);
+        XELOGI("NuiWakeEvent registered handle={:08X} (total: {})",
+               static_cast<uint32_t>(ev->handle()), captured.size());
+      }
+    }
+    // Broader sweep: the single event above turned out to be the *workers'
+    // queue signal, not the object the title's main thread waits on. Titles
+    // park their frame-consumer thread on some other kernel object, and that
+    // wait does not necessarily use wait_reason 3 / processor_mode 1, so it
+    // was never captured. Log every distinct object waited on after the NUI
+    // bind so we can see what the title is actually blocked on.
+    if (cvars::nui_log_wait_objects) {
+      static std::vector<uint32_t> seen;
+      auto handle = static_cast<uint32_t>(object->handle());
+      if (std::find(seen.begin(), seen.end(), handle) == seen.end() &&
+          seen.size() < 24) {
+        seen.push_back(handle);
+        XELOGI(
+            "NuiWaitObj: handle={:08X} type={} wait_reason={} "
+            "processor_mode={} alertable={}",
+            handle, (int)object->type(), wait_reason, processor_mode,
+            alertable);
+      }
+    }
+  }
+
   if (timeout_ptr == nullptr || *timeout_ptr != 0) {
     auto thread = XThread::GetCurrentThread();
-    XELOGI("xeKeWaitForSingleObject: tid={:08X} obj={:08X} (type={}) timeout={}",
+    XELOGD("xeKeWaitForSingleObject: tid={:08X} obj={:08X} (type={}) timeout={}",
            thread ? thread->thread_id() : 0,
            static_cast<uint32_t>(object->handle()),
            (int)object->type(),
@@ -1022,9 +1104,10 @@ dword_result_t KeWaitForSingleObject_entry(lpvoid_t object_ptr,
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   auto thread = XThread::GetCurrentThread();
   uint32_t lr = thread ? thread->thread_state()->context()->lr : 0;
-  XELOGI("KeWaitForSingleObject: tid={:08X} lr={:08X} obj={:08X} timeout={}",
+  XELOGD("KeWaitForSingleObject: tid={:08X} lr={:08X} obj={:08X} timeout={}",
          thread ? thread->thread_id() : 0, lr,
          static_cast<uint32_t>(object_ptr), timeout);
+
   return xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode,
                                  alertable, timeout_ptr ? &timeout : nullptr);
 }
@@ -1059,7 +1142,7 @@ dword_result_t NtWaitForSingleObjectEx_entry(dword_t object_handle,
                                              lpqword_t timeout_ptr) {
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   auto thread = XThread::GetCurrentThread();
-  XELOGI("NtWaitForSingleObjectEx: tid={:08X} handle={:08X} timeout={}",
+  XELOGD("NtWaitForSingleObjectEx: tid={:08X} handle={:08X} timeout={}",
          thread ? thread->thread_id() : 0,
          static_cast<uint32_t>(object_handle), timeout);
   return NtWaitForSingleObjectEx(object_handle, wait_mode, alertable,
@@ -1093,7 +1176,7 @@ dword_result_t KeWaitForMultipleObjects_entry(
   if (timeout_ptr == nullptr || timeout != 0) {
     auto thread = XThread::GetCurrentThread();
     uint32_t cnt = count, type = wait_type;
-    XELOGI("KeWaitForMultipleObjects: tid={:08X} cnt={} type={} timeout={}",
+    XELOGD("KeWaitForMultipleObjects: tid={:08X} cnt={} type={} timeout={}",
            thread ? thread->thread_id() : 0, cnt, type, timeout);
   }
   X_STATUS result = XObject::WaitMultiple(
@@ -1159,10 +1242,10 @@ dword_result_t NtWaitForMultipleObjectsEx_entry(
     auto thread = XThread::GetCurrentThread();
     uint32_t lr = thread ? thread->thread_state()->context()->lr : 0;
     uint32_t cnt = count, type = wait_type;
-    XELOGI("NtWaitForMultipleObjectsEx: tid={:08X} lr={:08X} cnt={} type={} timeout={}",
+    XELOGD("NtWaitForMultipleObjectsEx: tid={:08X} lr={:08X} cnt={} type={} timeout={}",
            thread ? thread->thread_id() : 0, lr, cnt, type, timeout);
     for (uint32_t i = 0; i < cnt; ++i) {
-      XELOGI("  handle[{}] = {:08X}", i, static_cast<uint32_t>(handles[i]));
+      XELOGD("  handle[{}] = {:08X}", i, static_cast<uint32_t>(handles[i]));
     }
   }
   if (!count || count > 64 ||

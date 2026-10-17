@@ -16,6 +16,7 @@
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xthread.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_private.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_error.h"
@@ -350,19 +351,13 @@ dword_result_t XamReadString_entry(dword_t title_id, qword_t id,
 }
 DECLARE_XAM_EXPORT1(XamReadString, kNone, kImplemented);
 
-dword_result_t XamXStudioRequest_entry(dword_t unk1, lpdword_t unk2) {
-  // uses xstudio.xex function with an ordinal of 1
-  return X_E_FAIL;
-}
-DECLARE_XAM_EXPORT1(XamXStudioRequest, kNone, kStub);
 
 dword_result_t XamGetSystemVersion_entry() {
-  // eh, just picking one. If we go too low we may break new games, but
-  // this value seems to be used for conditionally loading symbols and if
-  // we pretend to be old we have less to worry with implementing.
-  // 0x200A3200
-  // 0x20096B00
-  return 0;
+  // Kinect Adventures checks:
+  //   XamGetSystemVersion() >= 0x200A3200 (dashboard 2.0.10496 / Kinect dash release)
+  // If lower, it skips initializing the NUI camera/identity session and disables
+  // the Kinect subsystem. Return 0x200A3200 so the game proceeds with the NUI pipeline.
+  return 0x200A3200;
 }
 DECLARE_XAM_EXPORT1(XamGetSystemVersion, kNone, kStub);
 
@@ -530,6 +525,27 @@ DECLARE_XAM_EXPORT1(XamLoaderLaunchTitle, kNone, kSketchy);
 void XamLoaderTerminateTitle_entry() {
   std::string title = "Title terminated";
   std::string message = "Game requested exit to dashboard.";
+  {
+    auto thread = XThread::GetCurrentThread();
+    uint32_t lr = 0;
+    if (thread && thread->thread_state() && thread->thread_state()->context()) {
+      lr = static_cast<uint32_t>(thread->thread_state()->context()->lr);
+    }
+    XELOGI("XamLoaderTerminateTitle called from lr={:08X} tid={:08X}", lr,
+           thread ? thread->thread_id() : 0);
+    if (lr) {
+      auto* code = kernel_state()->memory()->TranslateVirtual<uint8_t*>(lr - 0x7C);
+      if (code) {
+        for (int row = 0; row < 9; ++row) {
+          std::string words;
+          for (int i = 0; i < 8; ++i) {
+            words += fmt::format("{:08X} ", xe::load_and_swap<uint32_t>(code + (row * 8 + i) * 4));
+          }
+          XELOGI("XamLoaderTerminateTitle code @{:010X}: {}", lr - 0x7C + row * 32, words);
+        }
+      }
+    }
+  }
   assert_always("Game requested exit to dashboard via XamLoaderTerminateTitle");
 
   auto display_window = kernel_state()->emulator()->display_window();

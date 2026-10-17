@@ -546,6 +546,15 @@ void XThread::Execute() {
               thread_id_, handle(), thread_name_, thread_->system_id());
   XELOGI("XThread::Execute start_address={:08X}, xapi_thread_startup={:08X}",
          creation_params_.start_address, creation_params_.xapi_thread_startup);
+  // The title's NUI worker (guest 0x82C48D18) receives a pointer to its worker
+  // object in r3 (`mr r28, r3`, then [0] = owner, [0x3c] = event, [0x54]/[0x58]
+  // = ring read/write indices). Its push entry point 0x82C48EB0 is referenced
+  // nowhere in the title image or the guest heap, so the only way to reach the
+  // worker object is through the thread parameter. Log it.
+  if (creation_params_.start_context) {
+    XELOGI("XThread::Execute start_context={:08X}",
+           creation_params_.start_context);
+  }
   // Let the kernel know we are starting.
   kernel_state()->OnThreadExecute(this);
 

@@ -110,7 +110,7 @@ class UserProfile {
 
   std::string name() const { return account_info_.GetGamertagString(); }
   uint32_t signin_state() const {
-    return static_cast<uint32_t>(SignInState::SignedInLocally);
+    return static_cast<uint32_t>(SignInState::SignedInToLive);
   };
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
